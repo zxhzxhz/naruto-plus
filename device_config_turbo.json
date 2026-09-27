@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "probe": false,
+  "frameRate": 120,
+  "resolution": "native",
+  "pacerHz": 0,
+  "logicFps": 0,
+  "engineFps": 0,
+  "timeBase": 0,
+  "stepBase": 0,
+  "latchDivisor": 0,
+  "latchMask": 0,
+  "clockCompensate": true,
+  "vsyncCbHz": 0,
+  "forceDirect": true,
+  "directUsage": false,
+  "forceContentsScale": false,
+  "allowEngineFpsOver60": false,
+  "dumpPointers": false,
+  "noVsync": false,
+  "captureStderr": true,
+  "statSeconds": 5
+}

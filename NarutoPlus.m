@@ -94,7 +94,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.11"
+#define NP_VERSION              @"1.12"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_CRASH_FILENAME       @"NarutoPlus.crash.log"   // 崩溃黑匣子（小文件，便于拉取）
@@ -373,7 +373,7 @@ static id NpCfgDefaultJSON(void)
         @"vsyncCbHz": @0,                     // per-vsync 回调频率；0=自动 60Hz（原始设计节拍）
         @"stepBase": @0,                      // 步进基线（0=不动；启用 latch 时保持 0）
         @"latchDivisor": @0,                  // 逻辑节流：0=自动(帧率÷30)，120fps→4
-        @"latchMask": @1,                     // 节流目标：1=更新主体(默认) 3=+辅助A 7=+辅助B
+        @"latchMask": @0,                     // 节流目标：0=关闭(默认/安全) 1=仅更新主体 3=+A 7=+A+B（实测会崩渲染工作线程）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -907,6 +907,7 @@ static int64_t NpHook_UpdateMain(uintptr_t self)
 {
     uint32_t d = gLatchDiv ? gLatchDiv : 1;
     gLatchRun = (d <= 1) ? YES : ((++gLatchFrame % d) == 0);
+    if (!gLatchRun && !(gLatchMask & 1)) gLatchRun = YES;   // mask 未选中「更新主体」→ 不节流（安全）
     if (gLatchRun) { gLatchRuns++; return gOrigUpdateMain(self); }
     gLatchSkips++;
     return 0;
@@ -937,6 +938,8 @@ static void NpApplyLatch(void)
     if (d < 1) d = 1;
     if (d > 240) d = 240;
     uint32_t mask = (gCfg.latchMask > 0) ? (uint32_t)gCfg.latchMask : 0;
+    if (mask != 0)
+        NPLOG(@"⚠️ 逻辑节流为实验特性：实测「跳过更新」会让渲染器工作线程 (0x531054→0x531144→0x53DFAC) 崩，仅建议短暂试验");
 
     if (d != gLatchDiv || mask != gLatchMask) {
         gLatchDiv = d;
