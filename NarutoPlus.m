@@ -106,6 +106,8 @@
 #define RVA_VK_CREATE_SWAPCHAIN 0x5D1504u   // vkCreateSwapchainKHR
 #define RVA_MVK_SWAPCHAIN_INIT  0x65ED70u   // MVKSwapchain::init（文档用）
 #define RVA_NUCCSYS_INSTANCE    0xFDEC00u   // qword_100FDEC00 = nuccSys 单例指针
+#define RVA_NUMMRENDER_INSTANCE 0xF7F328u   // mmSingleton<nummRender,nrAppAllocator>::s_Instance
+#define OFF_NUMM_FPS_DIVISOR    0x9Cu       // nummRender+156 = VSync 分频器（线程每拍读）
 
 // nuccSys 字段
 #define OFF_NUCC_RENDER_W       1196u       // +0x4AC
@@ -528,6 +530,18 @@ static void NpPollNuCCSys(void)
         if (div != (uint32_t)gCfg.effDivisor) {
             np_wr32(inst + OFF_NUCC_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
             NPLOG(@"[FPS] (轮询) nuccSys+0x4B8 分频器 %u → %d", div, gCfg.effDivisor);
+        }
+    }
+
+    // nummRender 单例里的分频器（VSync 线程每拍实时读它）
+    if (gCfg.effDivisor > 0) {
+        uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
+        if (rend > 0x100000000ULL) {
+            uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
+            if (d2 != (uint32_t)gCfg.effDivisor) {
+                np_wr32(rend + OFF_NUMM_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
+                NPLOG(@"[FPS] (轮询) nummRender+0x9C 分频器 %u → %d", d2, gCfg.effDivisor);
+            }
         }
     }
     if (gPollExtentWanted) {
