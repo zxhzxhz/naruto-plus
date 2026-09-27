@@ -218,3 +218,40 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | **v1.3** | **止血 + 模型自证**：1) 设备实测「进 3D 场景闪退」的根因是 fps 字节>60 ⇒ `engineFps` 硬钳到 ≤60（引擎自带校验 `fps>60 \|\| 60%fps → 60`，且 60/fps 会算成 0 落进 `nuccSys+0x4B8`），渲染帧率不受影响，仍是「节拍×分频器」；2) `[STAT]` 新增 `时间流速预测 = 实测fps ÷ 引擎字节`，用于一次性判定步进模型（自然模型预测 2x / 备选模型预测 1x） |
 | **v1.2** | **解耦「渲染帧率」与「逻辑步进」**：定位到引擎内部时间基 = 3000 单位/秒，逻辑固定步进 = `3000 / nuccSys[+0x992]`（`sub_1004D4838` / `sub_1004F836C` / `sub_10051F96C` / `sub_1005205C8` 四处实锤）。120fps 下若步进仍为 1/30 会 4× 加速 ⇒ 新增 `engineFps`（默认自动 = frameRate）直写 fps 字节=120 → 步进 25/3000 秒 = 1/120，时间流速回归 1.0×；并把「分频器 + fps 字节」的纠正收敛到 `NpEnforceEngineState()`，在 `SetFrameRate` hook 之后、`Init` 之后、每秒轮询三个时机强制执行（游戏自己调 `SetFrameRate(30)` 会被立刻纠回） |
 | **v1.1** | 修 `%s` 传 NSString 导致日志乱码；配置改为非原子写+回读校验、无效配置自动备份 `.bad` 并重写；**分辨率改为以「引擎请求的 extent」为原生基准**（不再依赖 UIScreen，constructor 阶段即可正确决策）；`forceDirect` 判定同样去 UIKit 依赖（修复设备实测 direct 未生效）；新增 `[GEO]` 图层/屏幕几何快照、`directUsage` / `forceContentsScale` 实验开关；STAT 行补充 Init/SetFrameRate 调用计数与 swapchain 原始→覆写尺寸 |
+
+---
+
+## 9. 最终能力矩阵与结论（v1.12）
+
+### 9.1 已确认可用 ✅
+
+| 能力 | 证据 |
+| :--- | :--- |
+| **120fps 渲染 + Metal HUD「Direct」** | `[STAT] 实测 119.9~120.1 fps`、`layer(opaque=1 …)`、`[SC] 覆写 alpha=1`；用户实机确认 HUD 显示 Direct |
+| 原生分辨率（2752×2064 = iPad Pro 13"M4 原生） | `[SC] 原始 extent=2752x2064`（引擎本来就要原生，我们只做直写属性修正） |
+| 分辨率开关（native / 比例 / 固定 WxH） | hook `vkCreateSwapchainKHR` 覆写 `imageExtent`（RVA 0x5D1504） |
+| 配置/日志落 Documents、热重载、崩溃黑匣子 | `NarutoPlus.json / .log / .crash.log / .state` |
+| 无线部署与日志拉取（RSD 隧道） | `wifi_np.py ls|pull|push`（隧道由 ipad-wifi 工作台提供） |
+
+### 9.2 硬性限制 ❌ —— 为什么做不到「120fps + 原速」
+
+| 事实 | 证据 |
+| :--- | :--- |
+| 游戏逻辑按**帧**推进（30Hz 设计，自己调用 `SetFrameRate(30)`） | 帧率提到 120 后：`stepBase=750`（动画步进已 1.00×）且主时钟 3000 单位/秒（已 1.00×），游戏仍 **4× 加速** |
+| 引擎的 `步进/主时钟` 只影响**动画播放**，不影响游戏逻辑 | 同上的对照实验 |
+| 唯一「把每帧步进改成 1/120」的理论解 = 直写 fps 字节 120 | 实测**进 3D 场景闪退**：`60/byte=0` 落进 `nuccSys+0x4B8`，且引擎自带校验就是 `fps>60 → 60`（内部有 60 长度假设） |
+| 「跳过更新、保留绘制」= 逻辑节流 | **崩渲染工作线程**：`sub_1004C96A0`(线程入口) → `sub_100531054`(工作循环) → `sub_100531144` → `sub_10053DFAC`，Signal 11 `addr=0x4014042200000000`（更新→派发任务→工作线程消费 的握手被破坏） |
+
+> 结论：**本作是「帧驱动 + 30Hz 定步进」设计，帧率与游戏速度强绑定**；
+> 引擎没有「多渲染少逻辑」的插值机制，因此 120fps 必然伴随 4× 速度（或 2× @60fps）。
+
+### 9.3 推荐预设
+
+| 档位 | 配置要点 | 效果 |
+| :--- | :--- | :--- |
+| **日常（默认）** | `frameRate:30, latchMask:0, forceDirect:true` | 原速 1.00×，Direct 直写、原生分辨率、日志/配置可用 |
+| 60fps 档 | `frameRate:60`（`latchMask:0`） | 60fps 呈现，游戏约 2× |
+| **快进档** | `frameRate:120`（`latchMask:0`） | 120fps 呈现 + Direct，游戏 4×（不崩，但只能当"快进"玩） |
+
+配置文件：`device_config.json`（日常档）／`device_config_turbo.json`（快进档），
+用 `python wifi_np.py push` 推送（或手动改设备上 `Documents/NarutoPlus.json`，1 秒热重载）。
