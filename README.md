@@ -115,10 +115,14 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
   "resolution": "native", // "native" | "1.0"/"0.75"/"0.5"(按屏幕像素比例) | "1920x1080"(固定)
 
   // 进阶
-  "forceDirect": true,    // 原生分辨率时强制 opaque / framebufferOnly / sRGB
-  "noVsync": false,       // true = presentMode 改 IMMEDIATE（更低延迟，可能撕裂）
-  "captureStderr": true,  // 把游戏引擎自己的 NSLog/stderr 也写进同一日志
-  "statSeconds": 5        // STAT 统计窗口（秒）
+  "forceDirect": true,         // 原生分辨率时强制 compositeAlpha=OPAQUE / 图层 opaque（安全档）
+  "directUsage": false,        // 激进档：把 imageUsage 改成「仅 COLOR_ATTACHMENT」
+                               //   → MoltenVK 置 framebufferOnly=YES（若引擎会 blit swapchain 图像，
+                               //      画面可能变黑，改回 false 立即恢复）
+  "forceContentsScale": false, // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
+  "noVsync": false,            // true = presentMode 改 IMMEDIATE（更低延迟，可能撕裂）
+  "captureStderr": true,       // 把游戏引擎自己的 NSLog/stderr 也写进同一日志
+  "statSeconds": 5             // STAT 统计窗口（秒）
 }
 ```
 
@@ -196,3 +200,4 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | 版本 | 内容 |
 |---|---|
 | v1.0 | 首版：VSync 节拍补丁 + Init 分频器改写 + swapchain 分辨率/直写属性 hook + 图层统计；配置双开关 + 热重载 |
+| **v1.1** | 修 `%s` 传 NSString 导致日志乱码；配置改为非原子写+回读校验、无效配置自动备份 `.bad` 并重写；**分辨率改为以「引擎请求的 extent」为原生基准**（不再依赖 UIScreen，constructor 阶段即可正确决策）；`forceDirect` 判定同样去 UIKit 依赖（修复设备实测 direct 未生效）；新增 `[GEO]` 图层/屏幕几何快照、`directUsage` / `forceContentsScale` 实验开关；STAT 行补充 Init/SetFrameRate 调用计数与 swapchain 原始→覆写尺寸 |

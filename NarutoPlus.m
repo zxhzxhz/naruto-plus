@@ -5,7 +5,7 @@
 //  目标二进制 : narutoNext1 (v1.0.1, arm64 thin)  NUMM/nucc 引擎 + MoltenVK(Vulkan→Metal)
 //  运行环境   : LiveContainer (ellekit / TweakLoader)，也兼容普通越狱注入
 //  日志       : <guest Documents>/NarutoPlus.log
-//  配置       : <guest Documents>/NarutoPlus.json （首次运行自动生成默认配置）
+//  配置       : <guest Documents>/NarutoPlus.json （首次运行自动生成；解析失败会自动备份重写）
 //
 //  ============================ 逆向结论（静态定位） ============================
 //  RVA = 相对 __TEXT 基址(0x100000000) 的偏移，等价于 Mach-O 文件偏移。
@@ -24,7 +24,7 @@
 //      "numm VSyncCallbackThread" 线程体                        RVA 0x4C6744
 //          MOV W24,#0x4119 (16665)  @ +0x48   追帧阈值
 //          MOV W25,#0x411A (16666)  @ +0x4C   VSync 周期(µs) = 60Hz 硬编码
-//          MOVN X26,#0x411A         @ +0x50   相位回退
+//          MOVN X26,#0x4119 (=-16666) @ +0x50 相位回退
 //          循环：++counter >= divisor → 唤醒 FrameStartThread；每拍都跑 per-vsync 回调
 //          ⇒ 实际帧率 = 1e6 / 周期 / divisor   （默认 16666µs + divisor 2 = 30fps）
 //          ⇒ 120fps 需：周期 8333µs 且 divisor = 1
@@ -37,21 +37,21 @@
 //
 //  [3] Metal HUD 的 "Composited / Direct"
 //      = 窗口合成器合成 vs 直写扫描输出(direct scanout)。
-//      Direct 条件：drawable == 屏幕原生像素 + 图层 opaque + framebufferOnly
-//      + 非 EDR 色彩空间（无额外缩放/合成）。
 //      控制点 = MoltenVK 的 swapchain 创建入参：
 //      vkCreateSwapchainKHR(device, createInfo, alloc, out)    RVA 0x5D1504
 //          imageColorSpace @+40   imageExtent @+44/+48   imageUsage @+56
 //          compositeAlpha  @+84   presentMode @+88
 //      （MoltenVK 内部 MVKSwapchain::init @0x65ED70 把这些字段直接喂给 CAMetalLayer）
+//      本补丁在原生分辨率下强制 compositeAlpha=OPAQUE（可选：usage=COLOR_ATTACHMENT
+//      → MoltenVK 置 framebufferOnly=YES），并把图层几何/属性全量打进日志供对照。
 //
 //  ============================ 本补丁做什么 ============================
 //      1. 代码补丁：VSync 节拍 16666µs → 1e6/目标Hz（120fps → 8333µs）
 //      2. Hook nummRender::Init 调用点：按目标帧率改写 divisor（120fps → 1）
-//      3. Hook vkCreateSwapchainKHR：强制 imageExtent = 配置分辨率；
-//         原生分辨率时把 compositeAlpha/usage/colorspace 改成直写友好值
-//      4. Hook CAMetalLayer：opaque/framebufferOnly/displaySync 修正 + 实时 FPS 统计
-//      5. 全步骤日志 + 配置热重载（改完 JSON 等几秒生效）
+//         （hook 未命中时由 1 秒轮询直接写 nummRender+0x9C 兜底）
+//      3. Hook vkCreateSwapchainKHR：分辨率按配置改写；原生分辨率时改直写友好属性
+//      4. Hook CAMetalLayer：几何/属性快照、opaque/framebufferOnly/contentsScale 修正、FPS 统计
+//      5. 全步骤日志 + 配置热重载
 //
 //  纯 Objective-C + C 实现：不依赖 Logos / CydiaSubstrate；
 //  C 函数 hook 走 ellekit 的 MSHookFunction（缺失时降级为数据轮询，见日志）
@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.0"
+#define NP_VERSION              @"1.1"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -100,20 +100,20 @@
 #define RVA_PACER_THREAD        0x4C6744u   // numm VSyncCallbackThread 线程体
 #define RVA_PACER_MOV_W24       0x4C678Cu   // MOV  W24, #0x4119
 #define RVA_PACER_MOV_W25       0x4C6790u   // MOV  W25, #0x411A
-#define RVA_PACER_MOVN_X26      0x4C6794u   // MOVN X26, #0x411A
+#define RVA_PACER_MOVN_X26      0x4C6794u   // MOVN X26, #0x4119 (=-16666)
 #define RVA_SET_FRAMERATE       0x4EA348u   // nuccSys::SetFrameRate
 #define RVA_UPDATE_RENDER_EXT   0x4E9AE0u   // nuccSys::UpdateRenderExtent（文档用）
 #define RVA_VK_CREATE_SWAPCHAIN 0x5D1504u   // vkCreateSwapchainKHR
 #define RVA_MVK_SWAPCHAIN_INIT  0x65ED70u   // MVKSwapchain::init（文档用）
 #define RVA_NUCCSYS_INSTANCE    0xFDEC00u   // qword_100FDEC00 = nuccSys 单例指针
-#define RVA_NUMMRENDER_INSTANCE 0xF7F328u   // mmSingleton<nummRender,nrAppAllocator>::s_Instance
-#define OFF_NUMM_FPS_DIVISOR    0x9Cu       // nummRender+156 = VSync 分频器（线程每拍读）
+#define RVA_NUMMRENDER_INSTANCE 0xF7F328u   // mmSingleton<nummRender,...>::s_Instance
 
 // nuccSys 字段
 #define OFF_NUCC_RENDER_W       1196u       // +0x4AC
 #define OFF_NUCC_RENDER_H       1198u       // +0x4AE
 #define OFF_NUCC_FPS_DIVISOR    1208u       // +0x4B8
 #define OFF_NUCC_FPS_EFFECTIVE  2450u       // +0x992
+#define OFF_NUMM_FPS_DIVISOR    0x9Cu       // nummRender+156
 
 // VkSwapchainCreateInfoKHR 字段偏移（与 MoltenVK 内部读法交叉验证过）
 #define VKSCI_COLORSPACE        40u
@@ -126,6 +126,7 @@
 #define VK_COMPOSITE_ALPHA_OPAQUE_BIT   1u
 #define VK_COLOR_SPACE_SRGB             0u
 #define VK_IMAGE_USAGE_COLOR_ATTACHMENT 0x10u
+#define VK_IMAGE_USAGE_TRANSFER_MASK    (0x1u | 0x2u)
 #define VK_PRESENT_MODE_IMMEDIATE       0u
 
 #pragma mark - ============================ 日志 ============================
@@ -225,18 +226,20 @@ typedef enum { NpResModeNative = 0, NpResModeScale = 1, NpResModeFixed = 2 } NpR
 
 typedef struct {
     BOOL        enabled;
-    BOOL        probe;          // 只观察不改
-    int         frameRate;      // 0 = 不改；30 / 60 / 120
-    int         pacerHz;        // 0 = 自动（= max(frameRate,60)，上限 120）
-    int         logicFps;       // 0 = 与 frameRate 相同（分频器按它算）
+    BOOL        probe;              // 只观察不改
+    int         frameRate;          // 0 = 不改；30 / 60 / 120
+    int         pacerHz;            // 0 = 自动（= max(frameRate,60)，上限 120）
+    int         logicFps;           // 0 = 与 frameRate 相同（分频器按它算）
     NpResMode   resMode;
     double      resScale;
     int         resW, resH;
-    BOOL        forceDirect;
-    BOOL        noVsync;
+    BOOL        forceDirect;        // 原生分辨率时把 swapchain/图层改成直写友好
+    BOOL        directUsage;        // 激进档：去掉 TRANSFER_SRC/DST → framebufferOnly=YES
+    BOOL        forceContentsScale; // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
+    BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
-    // 派生（由配置直接算出，不依赖 UIKit）
+    // 派生（仅用配置算术，不需要 UIKit）
     int         effFps;
     int         effPacerHz;
     int         effDivisor;
@@ -245,8 +248,6 @@ typedef struct {
 static NpConfig  gCfg;
 static NSString *gCfgPath = nil;
 static time_t    gCfgMTime = 0;
-static BOOL      gPollExtentWanted = NO;
-static int       gPollExtentW = 0, gPollExtentH = 0;
 
 static NSString *NpCfgPath(void)
 {
@@ -260,16 +261,18 @@ static NSString *NpCfgPath(void)
 static id NpCfgDefaultJSON(void)
 {
     return @{
-        @"enabled"       : @YES,
-        @"probe"         : @NO,
-        @"frameRate"     : @120,          // 开关①：0=不改 / 30 / 60 / 120
-        @"resolution"    : @"native",     // 开关②："native" | "1.0"/"0.75"(比例) | "1920x1080"
-        @"pacerHz"       : @0,            // 0=自动（= max(frameRate,60)）
-        @"logicFps"      : @0,            // 0=与 frameRate 一致
-        @"forceDirect"   : @YES,          // 原生分辨率时修正为直写友好图层属性
-        @"noVsync"       : @NO,           // true = presentMode 改 IMMEDIATE（可能撕裂）
-        @"captureStderr" : @YES,
-        @"statSeconds"   : @5
+        @"enabled"           : @YES,
+        @"probe"             : @NO,
+        @"frameRate"         : @120,          // 开关①：0=不改 / 30 / 60 / 120
+        @"resolution"        : @"native",     // 开关②："native" | "1.0"/"0.75"(比例) | "1920x1080"
+        @"pacerHz"           : @0,
+        @"logicFps"          : @0,
+        @"forceDirect"       : @YES,
+        @"directUsage"       : @NO,
+        @"forceContentsScale": @NO,
+        @"noVsync"           : @NO,
+        @"captureStderr"     : @YES,
+        @"statSeconds"       : @5
     };
 }
 
@@ -301,16 +304,16 @@ static double NpParseResolution(id v, NpResMode *mode, int *w, int *h)
 static void NpConfigDefaults(void)
 {
     memset(&gCfg, 0, sizeof(gCfg));
-    gCfg.enabled       = YES;
-    gCfg.frameRate     = 120;
-    gCfg.resMode       = NpResModeNative;
-    gCfg.resScale      = 1.0;
-    gCfg.forceDirect   = YES;
-    gCfg.captureStderr = YES;
-    gCfg.statSeconds   = 5;
+    gCfg.enabled        = YES;
+    gCfg.frameRate      = 120;
+    gCfg.resMode        = NpResModeNative;
+    gCfg.resScale       = 1.0;
+    gCfg.forceDirect    = YES;
+    gCfg.captureStderr  = YES;
+    gCfg.statSeconds    = 5;
 }
 
-// 帧率规划：只用配置算术，不需要 UIKit ⇒ 可在 constructor 里立即算好
+// 帧率规划：只用配置算术，不需要 UIKit ⇒ constructor 里立即生效
 static void NpComputePlan(void)
 {
     if (gCfg.frameRate <= 0) {
@@ -329,6 +332,20 @@ static void NpComputePlan(void)
     gCfg.effDivisor = div;
 }
 
+// 非原子写 + 回读校验（LiveContainer 的路径映射下原子写(rename)可能不可靠）
+static BOOL NpWriteDefaultConfig(NSString *path)
+{
+    NSData *d = [NSJSONSerialization dataWithJSONObject:NpCfgDefaultJSON()
+                                                options:NSJSONWritingPrettyPrinted error:NULL];
+    if (!d) { NPLOG(@"❌ 默认配置序列化失败"); return NO; }
+    BOOL ok = [d writeToFile:path atomically:NO];
+    NSData *back = [NSData dataWithContentsOfFile:path];
+    NPLOG(@"%@ 写入默认配置 %@  (%lu 字节，回读 %lu 字节)",
+          (ok && back.length == d.length) ? @"✅" : @"⚠️", path,
+          (unsigned long)d.length, (unsigned long)back.length);
+    return ok;
+}
+
 static void NpConfigLoad(void)
 {
     NSString *path = NpCfgPath();
@@ -338,111 +355,94 @@ static void NpConfigLoad(void)
 
     if (![fm fileExistsAtPath:path]) {
         NpConfigDefaults();
-        NSData *d = [NSJSONSerialization dataWithJSONObject:NpCfgDefaultJSON()
-                                                   options:NSJSONWritingPrettyPrinted error:NULL];
-        if (d) [d writeToFile:path atomically:YES];
-        NPLOG(@"未找到配置，已生成默认配置: %@", path);
+        NPLOG(@"未找到配置文件 → 生成默认配置");
+        NpWriteDefaultConfig(path);
         NpComputePlan();
         return;
     }
 
     NSData *d = [NSData dataWithContentsOfFile:path];
-    id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
+    id obj = (d.length > 0) ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
     if (![obj isKindOfClass:[NSDictionary class]]) {
-        NPLOG(@"⚠️ 配置解析失败（沿用默认值）: %@", path);
+        NSString *head = (d.length > 0) ? np_hexdump(d.bytes, MIN((NSUInteger)24, d.length)) : @"(空文件)";
+        NPLOG(@"⚠️ 配置无效（%lu 字节，首字节 %@）→ 备份为 .bad 并重写默认配置",
+              (unsigned long)d.length, head);
+        if (d.length > 0) {
+            NSString *bad = [path stringByAppendingString:@".bad"];
+            [fm removeItemAtPath:bad error:NULL];
+            [fm moveItemAtPath:path toPath:bad error:NULL];
+        } else {
+            [fm removeItemAtPath:path error:NULL];
+        }
         NpConfigDefaults();
+        NpWriteDefaultConfig(path);
         NpComputePlan();
         return;
     }
+
     NSDictionary *j = (NSDictionary *)obj;
     NpConfigDefaults();
 
-    if (j[@"enabled"])       gCfg.enabled       = [j[@"enabled"] boolValue];
-    if (j[@"probe"])         gCfg.probe         = [j[@"probe"] boolValue];
-    if (j[@"frameRate"])     gCfg.frameRate     = [j[@"frameRate"] intValue];
-    if (j[@"pacerHz"])       gCfg.pacerHz       = [j[@"pacerHz"] intValue];
-    if (j[@"logicFps"])      gCfg.logicFps      = [j[@"logicFps"] intValue];
-    if (j[@"forceDirect"])   gCfg.forceDirect   = [j[@"forceDirect"] boolValue];
-    if (j[@"noVsync"])       gCfg.noVsync       = [j[@"noVsync"] boolValue];
-    if (j[@"captureStderr"]) gCfg.captureStderr = [j[@"captureStderr"] boolValue];
-    if (j[@"statSeconds"])   gCfg.statSeconds   = [j[@"statSeconds"] intValue];
-    if (j[@"resolution"])    gCfg.resScale      = NpParseResolution(j[@"resolution"], &gCfg.resMode,
-                                                                    &gCfg.resW, &gCfg.resH);
+    if (j[@"enabled"])            gCfg.enabled            = [j[@"enabled"] boolValue];
+    if (j[@"probe"])              gCfg.probe              = [j[@"probe"] boolValue];
+    if (j[@"frameRate"])          gCfg.frameRate          = [j[@"frameRate"] intValue];
+    if (j[@"pacerHz"])            gCfg.pacerHz            = [j[@"pacerHz"] intValue];
+    if (j[@"logicFps"])           gCfg.logicFps           = [j[@"logicFps"] intValue];
+    if (j[@"forceDirect"])        gCfg.forceDirect        = [j[@"forceDirect"] boolValue];
+    if (j[@"directUsage"])        gCfg.directUsage        = [j[@"directUsage"] boolValue];
+    if (j[@"forceContentsScale"]) gCfg.forceContentsScale = [j[@"forceContentsScale"] boolValue];
+    if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
+    if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
+    if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
+    if (j[@"resolution"])         gCfg.resScale           = NpParseResolution(j[@"resolution"], &gCfg.resMode,
+                                                                              &gCfg.resW, &gCfg.resH);
 
     if (gCfg.statSeconds < 1)  gCfg.statSeconds = 1;
     if (gCfg.statSeconds > 60) gCfg.statSeconds = 60;
 
     NpComputePlan();
 
-    NPLOG(@"配置: enabled=%d probe=%d frameRate=%d resolution=%@ forceDirect=%d noVsync=%d pacerHz=%d logicFps=%d",
+    NPLOG(@"配置: enabled=%d probe=%d frameRate=%d resolution=%@ forceDirect=%d directUsage=%d forceContentsScale=%d noVsync=%d pacerHz=%d logicFps=%d",
           gCfg.enabled, gCfg.probe, gCfg.frameRate,
           (gCfg.resMode == NpResModeNative ? @"native"
              : (gCfg.resMode == NpResModeScale ? [NSString stringWithFormat:@"scale %.3f", gCfg.resScale]
                                                : [NSString stringWithFormat:@"%dx%d", gCfg.resW, gCfg.resH])),
-          gCfg.forceDirect, gCfg.noVsync, gCfg.pacerHz, gCfg.logicFps);
+          gCfg.forceDirect, gCfg.directUsage, gCfg.forceContentsScale, gCfg.noVsync, gCfg.pacerHz, gCfg.logicFps);
 }
 
-#pragma mark - ============================ 屏幕尺寸（懒查询） ============================
+#pragma mark - ============================ 目标分辨率推导 ============================
 
-static int gNativeW = 0, gNativeH = 0;   // 屏幕原生像素（横屏取向：W >= H）
-static NSTimeInterval gBootTs = 0;
-
-static void NpRefreshScreenSize(void)
+// 关键设计：以「引擎自己请求的 extent」为原生基准，不依赖 UIScreen 查询，
+// 这样在 constructor 阶段（UIKit 还没就绪）也能做出正确决策。
+static void NpDeriveExtent(int origW, int origH, int *outW, int *outH, BOOL *outIsNative)
 {
-    if (gNativeW > 0) return;
-    if (gBootTs > 0 && [NSDate timeIntervalSinceReferenceDate] < gBootTs + 0.15) return;   // 太早不碰 UIKit
-    @try {
-        CGRect nb = [UIScreen mainScreen].nativeBounds;
-        if (nb.size.width <= 0 || nb.size.height <= 0) return;
-        gNativeW = (int)llround(MAX(nb.size.width, nb.size.height));
-        gNativeH = (int)llround(MIN(nb.size.width, nb.size.height));
-    } @catch (NSException *e) {
-        NPLOG(@"⚠️ 查询 UIScreen.nativeBounds 异常: %@", e.reason);
-    }
-}
+    int w = origW, h = origH;
+    BOOL isNative = YES;
 
-// 按“引擎原始 extent 的取向”输出目标分辨率；origPortrait = 原始是竖的
-static void NpTargetExtentOriented(BOOL haveOrig, BOOL origPortrait, int *outW, int *outH)
-{
-    NpRefreshScreenSize();
-
-    if (gNativeW <= 0) {                 // 还没拿到屏幕信息 → 保持引擎原值
-        return;
-    }
-
-    int w = gNativeW, h = gNativeH;
-    if (gCfg.resMode == NpResModeScale && gCfg.resScale > 0) {
-        w = (int)llround(gNativeW * gCfg.resScale);
-        h = (int)llround(gNativeH * gCfg.resScale);
+    if (gCfg.resMode == NpResModeScale && gCfg.resScale > 0 && origW > 0 && origH > 0) {
+        w = (int)llround((double)origW * gCfg.resScale);
+        h = (int)llround((double)origH * gCfg.resScale);
+        isNative = NO;
     } else if (gCfg.resMode == NpResModeFixed && gCfg.resW > 0 && gCfg.resH > 0) {
         w = gCfg.resW; h = gCfg.resH;
-        if (h > w) { int t = w; w = h; h = t; }
+        if ((origH > origW) != (h > w)) { int t = w; w = h; h = t; }   // 取向对齐引擎
+        isNative = (w == origW && h == origH);
     }
 
-    if (w < 320)   w = 320;
-    if (h < 240)   h = 240;
-    if (w > 16384) w = 16384;
-    if (h > 16384) h = 16384;
+    if (w < 320)    w = 320;
+    if (h < 240)    h = 240;
+    if (w > 16384)  w = 16384;
+    if (h > 16384)  h = 16384;
 
-    if (haveOrig && origPortrait) { int t = w; w = h; h = t; }
     *outW = w & ~1;
     *outH = h & ~1;
+    if (outIsNative) *outIsNative = isNative;
 }
 
-static void NpTargetExtent(int *outW, int *outH)
+// 直写友好模式是否启用（只要是 native 分辨率就有意义，无需查屏幕）
+static BOOL NpDirectActive(void)
 {
-    int w = 0, h = 0;
-    NpTargetExtentOriented(NO, NO, &w, &h);
-    if (w <= 0 || h <= 0) { NpRefreshScreenSize(); w = gNativeW; h = gNativeH; }
-    if (w <= 0) { w = 1920; h = 1080; }
-    *outW = w; *outH = h;
-}
-
-static BOOL NpIsNativeResolution(void)
-{
-    if (gNativeW <= 0) return NO;
-    int w, h; NpTargetExtent(&w, &h);
-    return (MAX(w, h) == MAX(gNativeW, gNativeH) && MIN(w, h) == MIN(gNativeW, gNativeH));
+    return (gCfg.enabled && !gCfg.probe && gCfg.forceDirect && gCfg.resMode == NpResModeNative);
 }
 
 #pragma mark - ============================ 代码补丁 ============================
@@ -488,37 +488,54 @@ static BOOL NpResolveHookEngine(void)
 typedef int64_t (*InitThunkFn)(int16_t w, int16_t h, uint32_t preset, uint32_t flags, uint32_t divisor);
 static InitThunkFn gOrigInitThunk = NULL;
 static BOOL        gInitThunkHooked = NO;
+static volatile int gInitThunkCalls = 0;
 
 typedef int64_t (*SetFrameRateFn)(uintptr_t self, uint32_t fps);
 static SetFrameRateFn gOrigSetFrameRate = NULL;
+static volatile int   gSetFrameRateCalls = 0;
 
 static int64_t NpHook_InitThunk(int16_t w, int16_t h, uint32_t preset, uint32_t flags, uint32_t divisor)
 {
+    gInitThunkCalls++;
+
     if (!gCfg.enabled || gCfg.probe)
         return gOrigInitThunk(w, h, preset, flags, divisor);
 
     int tw = w, th = h;
-    NpTargetExtentOriented(YES, (h > w), &tw, &th);
-    if (tw <= 0 || th <= 0) { tw = w; th = h; }
+    BOOL isNative = YES;
+    NpDeriveExtent(w, h, &tw, &th, &isNative);
 
     uint32_t nd = (gCfg.effDivisor > 0) ? (uint32_t)gCfg.effDivisor : divisor;
 
-    NPLOG(@"[INIT] nummRender::Init 引擎入参 w=%d h=%d preset=%u flags=0x%x divisor=%u  →  改写 w=%d h=%d divisor=%u  (目标 %dfps / 节拍 %dHz)",
-          w, h, preset, flags, divisor, tw, th, nd, gCfg.effFps, gCfg.effPacerHz);
+    NPLOG(@"[INIT] #%d nummRender::Init 引擎入参 w=%d h=%d preset=%u flags=0x%x divisor=%u  →  改写 w=%d h=%d divisor=%u  (原生=%d 目标 %dfps / 节拍 %dHz)",
+          gInitThunkCalls, w, h, preset, flags, divisor, tw, th, nd, isNative, gCfg.effFps, gCfg.effPacerHz);
 
     return gOrigInitThunk((int16_t)tw, (int16_t)th, preset, flags, nd);
 }
 
 static int64_t NpHook_SetFrameRate(uintptr_t self, uint32_t fps)
 {
+    gSetFrameRateCalls++;
     NPLOG(@"[FPS] 游戏调用 nuccSys::SetFrameRate(%u)  (仅记录；分频器由本补丁在 Init 阶段覆盖)", fps);
     return gOrigSetFrameRate(self, fps);
 }
 
-// hook 不可用时的降级通道：直接写 nuccSys 实例字段
+// hook 不可用 / Init 未命中时的兜底：直接写单例字段（VSync 线程每拍实时读 nummRender+0x9C）
 static void NpPollNuCCSys(void)
 {
-    if (!gBase) return;
+    if (!gBase || !gCfg.enabled || gCfg.probe) return;
+
+    if (gCfg.effDivisor > 0) {
+        uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
+        if (rend > 0x100000000ULL) {
+            uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
+            if (d2 != (uint32_t)gCfg.effDivisor) {
+                np_wr32(rend + OFF_NUMM_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
+                NPLOG(@"[FPS] (轮询) nummRender+0x9C 分频器 %u → %d", d2, gCfg.effDivisor);
+            }
+        }
+    }
+
     uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
     if (!inst || inst < 0x100000000ULL) return;
 
@@ -530,27 +547,6 @@ static void NpPollNuCCSys(void)
         if (div != (uint32_t)gCfg.effDivisor) {
             np_wr32(inst + OFF_NUCC_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
             NPLOG(@"[FPS] (轮询) nuccSys+0x4B8 分频器 %u → %d", div, gCfg.effDivisor);
-        }
-    }
-
-    // nummRender 单例里的分频器（VSync 线程每拍实时读它）
-    if (gCfg.effDivisor > 0) {
-        uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
-        if (rend > 0x100000000ULL) {
-            uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
-            if (d2 != (uint32_t)gCfg.effDivisor) {
-                np_wr32(rend + OFF_NUMM_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
-                NPLOG(@"[FPS] (轮询) nummRender+0x9C 分频器 %u → %d", d2, gCfg.effDivisor);
-            }
-        }
-    }
-    if (gPollExtentWanted) {
-        uint16_t w = np_rd16(inst + OFF_NUCC_RENDER_W);
-        uint16_t h = np_rd16(inst + OFF_NUCC_RENDER_H);
-        if (w != (uint16_t)gPollExtentW || h != (uint16_t)gPollExtentH) {
-            np_wr16(inst + OFF_NUCC_RENDER_W, (uint16_t)gPollExtentW);
-            np_wr16(inst + OFF_NUCC_RENDER_H, (uint16_t)gPollExtentH);
-            NPLOG(@"[RES] (轮询) nuccSys 渲染尺寸 %ux%u → %dx%d", w, h, gPollExtentW, gPollExtentH);
         }
     }
 }
@@ -600,6 +596,7 @@ static BOOL NpApplyPacerPeriod(int pacerHz)
 typedef int32_t (*VkCreateSwapchainFn)(void *device, void *createInfo, const void *alloc, void **out);
 static VkCreateSwapchainFn gOrigVkCreateSwapchain = NULL;
 static volatile int gSwapchainCount = 0;
+static volatile uint32_t gLastOrigW = 0, gLastOrigH = 0, gLastNewW = 0, gLastNewH = 0;
 
 static int32_t NpHook_vkCreateSwapchainKHR(void *device, void *createInfo, const void *alloc, void **out)
 {
@@ -618,19 +615,21 @@ static int32_t NpHook_vkCreateSwapchainKHR(void *device, void *createInfo, const
     uint32_t origPM    = *(uint32_t *)(ci + VKSCI_PRESENT_MODE);
 
     int tw = (int)origW, th = (int)origH;
-    NpTargetExtentOriented((origW > 0 && origH > 0), (origH > origW), &tw, &th);
-    if (tw <= 0 || th <= 0) { tw = (int)origW; th = (int)origH; }
-    if (tw <= 0 || th <= 0) { tw = 1920; th = 1080; }
+    BOOL isNative = YES;
+    NpDeriveExtent((int)origW, (int)origH, &tw, &th, &isNative);
+    if (tw <= 0 || th <= 0) { tw = (int)origW & ~1; th = (int)origH & ~1; }
 
     *(uint32_t *)(ci + VKSCI_EXTENT)     = (uint32_t)tw;
     *(uint32_t *)(ci + VKSCI_EXTENT + 4) = (uint32_t)th;
 
-    BOOL direct = NO;
-    if (gCfg.forceDirect && NpIsNativeResolution()) {
-        direct = YES;
-        *(uint32_t *)(ci + VKSCI_COMPOSITE_ALPHA) = VK_COMPOSITE_ALPHA_OPAQUE_BIT;
-        *(uint32_t *)(ci + VKSCI_COLORSPACE)      = VK_COLOR_SPACE_SRGB;
-        *(uint32_t *)(ci + VKSCI_USAGE)           = VK_IMAGE_USAGE_COLOR_ATTACHMENT;
+    BOOL direct = NpDirectActive() && isNative;
+    if (direct) {
+        if (origAlpha != VK_COMPOSITE_ALPHA_OPAQUE_BIT)
+            *(uint32_t *)(ci + VKSCI_COMPOSITE_ALPHA) = VK_COMPOSITE_ALPHA_OPAQUE_BIT;
+        if (origCS != VK_COLOR_SPACE_SRGB)
+            *(uint32_t *)(ci + VKSCI_COLORSPACE) = VK_COLOR_SPACE_SRGB;
+        if (gCfg.directUsage)
+            *(uint32_t *)(ci + VKSCI_USAGE) = VK_IMAGE_USAGE_COLOR_ATTACHMENT;
     }
     if (gCfg.noVsync)
         *(uint32_t *)(ci + VKSCI_PRESENT_MODE) = VK_PRESENT_MODE_IMMEDIATE;
@@ -640,17 +639,19 @@ static int32_t NpHook_vkCreateSwapchainKHR(void *device, void *createInfo, const
     uint32_t newAlpha = *(uint32_t *)(ci + VKSCI_COMPOSITE_ALPHA);
     uint32_t newPM    = *(uint32_t *)(ci + VKSCI_PRESENT_MODE);
 
+    gLastOrigW = origW; gLastOrigH = origH; gLastNewW = (uint32_t)tw; gLastNewH = (uint32_t)th;
+
     int n = ++gSwapchainCount;
     if (n <= 8 || origW != (uint32_t)tw || origH != (uint32_t)th) {
-        NPLOG(@"[SC] #%d vkCreateSwapchainKHR 原始: extent=%ux%u colorspace=%u usage=0x%x alpha=%u presentMode=%u",
+        NPLOG(@"[SC] #%d 原始: extent=%ux%u colorspace=%u usage=0x%x alpha=%u presentMode=%u",
               n, origW, origH, origCS, origUsage, origAlpha, origPM);
-        NPLOG(@"[SC] #%d 覆写后: extent=%ux%u colorspace=%u usage=0x%x alpha=%u presentMode=%u   (直写目标=%d noVsync=%d)",
-              n, tw, th, newCS, newUsage, newAlpha, newPM, direct, gCfg.noVsync);
-        NPLOG(@"[SC] 参考: presentMode 0=IMMEDIATE 1=MAILBOX 2=FIFO(vsync) | alpha 1=OPAQUE | usage 0x10=COLOR_ATTACHMENT | colorspace 0=SRGB");
+        NPLOG(@"[SC] #%d 覆写: extent=%ux%u colorspace=%u usage=0x%x alpha=%u presentMode=%u   (direct=%d isNative=%d directUsage=%d noVsync=%d)",
+              n, tw, th, newCS, newUsage, newAlpha, newPM, direct, isNative, gCfg.directUsage, gCfg.noVsync);
+        NPLOG(@"[SC] 参考: presentMode 0=IMMEDIATE 2=FIFO | alpha 1=OPAQUE 8=INHERIT | usage 0x13=COLOR_ATTACH+TRANSFER_SRC/DST 0x10=仅COLOR_ATTACHMENT | colorspace 0=SRGB");
     }
 
     int32_t r = gOrigVkCreateSwapchain(device, copy, alloc, out);
-    if (n <= 8) NPLOG(@"[SC] #%d 返回 VkResult=%d%s", n, r, (r == 0 ? @" (VK_SUCCESS)" : @""));
+    if (n <= 8) NPLOG(@"[SC] #%d 返回 VkResult=%d%@", n, r, (r == 0 ? @" (VK_SUCCESS)" : @""));
     return r;
 }
 
@@ -659,6 +660,7 @@ static int32_t NpHook_vkCreateSwapchainKHR(void *device, void *createInfo, const
 static volatile uint64_t gFrameCount = 0;
 static volatile int      gLastDrawableW = 0, gLastDrawableH = 0;
 static volatile int      gLayerOpaque = -1, gLayerFramebufferOnly = -1, gLayerDisplaySync = -1;
+static volatile double   gLayerContentsScale = -1;
 
 static BOOL NpSwizzle(Class cls, SEL sel, IMP imp, IMP *orig)
 {
@@ -667,6 +669,40 @@ static BOOL NpSwizzle(Class cls, SEL sel, IMP imp, IMP *orig)
     if (orig) *orig = method_getImplementation(m);
     method_setImplementation(m, imp);
     return YES;
+}
+
+// 图层/屏幕几何快照 —— 判断 Composited 成因的关键证据
+static void NpLogGeometry(CALayer *layer, const char *tag)
+{
+    @try {
+        UIScreen *sc = [UIScreen mainScreen];
+        CGRect nb = sc.nativeBounds, b = sc.bounds;
+        NSInteger panelMax = 60;
+        if ([sc respondsToSelector:@selector(maximumFramesPerSecond)]) panelMax = sc.maximumFramesPerSecond;
+        NPLOG(@"[GEO/%s] screen: bounds=%.0fx%.0f pt  nativeBounds=%.0fx%.0f px  scale=%.2f nativeScale=%.2f maxFPS=%ld",
+              tag, b.size.width, b.size.height, nb.size.width, nb.size.height, sc.scale, sc.nativeScale, (long)panelMax);
+
+        if (layer) {
+            CALayer *pres = layer.presentationLayer ?: layer;
+            CGSize ds = CGSizeZero;
+            BOOL fbOnly = NO;
+            BOOL isMetal = [layer respondsToSelector:@selector(framebufferOnly)];
+            if (isMetal) {
+                ds = [(CAMetalLayer *)layer drawableSize];
+                fbOnly = [(CAMetalLayer *)layer framebufferOnly];
+            }
+            NPLOG(@"[GEO/%s] layer: frame=(%.0f,%.0f %.0fx%.0f) bounds=%.0fx%.0f position=(%.0f,%.0f) anchor=(%.2f,%.2f) "
+                  @"contentsScale=%.2f drawableSize=%.0fx%.0f gravity=%@ opaque=%d fbOnly=%d masksToBounds=%d sublayers=%lu",
+                  tag, pres.frame.origin.x, pres.frame.origin.y, pres.frame.size.width, pres.frame.size.height,
+                  pres.bounds.size.width, pres.bounds.size.height,
+                  pres.position.x, pres.position.y, pres.anchorPoint.x, pres.anchorPoint.y,
+                  pres.contentsScale, ds.width, ds.height,
+                  pres.contentsGravity, pres.opaque, fbOnly, pres.masksToBounds,
+                  (unsigned long)(pres.sublayers ? pres.sublayers.count : 0));
+        }
+    } @catch (NSException *e) {
+        NPLOG(@"[GEO/%s] 快照异常: %@", tag, e.reason);
+    }
 }
 
 static id (*orig_nextDrawable)(id, SEL);
@@ -681,8 +717,10 @@ static void Np_setDrawableSize(id self, SEL _cmd, CGSize sz)
 {
     gLastDrawableW = (int)sz.width; gLastDrawableH = (int)sz.height;
     static int logged = 0;
-    if (logged++ < 6)
-        NPLOG(@"[LAYER] setDrawableSize: %.0fx%.0f   (屏幕原生 %dx%d)", sz.width, sz.height, gNativeW, gNativeH);
+    if (logged++ < 6) {
+        NPLOG(@"[LAYER] setDrawableSize: %.0fx%.0f", sz.width, sz.height);
+        if (logged == 1) NpLogGeometry((CALayer *)self, "首帧");
+    }
     orig_setDrawableSize(self, _cmd, sz);
 }
 
@@ -690,7 +728,7 @@ static void (*orig_setOpaque)(id, SEL, BOOL);
 static void Np_setOpaque(id self, SEL _cmd, BOOL v)
 {
     gLayerOpaque = v ? 1 : 0;
-    if (gCfg.enabled && !gCfg.probe && gCfg.forceDirect && NpIsNativeResolution() && !v) {
+    if (NpDirectActive() && !v) {
         NPLOG(@"[LAYER] setOpaque:NO → 强制 YES（Direct 直写需要不透明）");
         v = YES;
     }
@@ -701,8 +739,8 @@ static void (*orig_setFramebufferOnly)(id, SEL, BOOL);
 static void Np_setFramebufferOnly(id self, SEL _cmd, BOOL v)
 {
     gLayerFramebufferOnly = v ? 1 : 0;
-    if (gCfg.enabled && !gCfg.probe && gCfg.forceDirect && NpIsNativeResolution() && !v) {
-        NPLOG(@"[LAYER] setFramebufferOnly:NO → 强制 YES（避免被合成器读回）");
+    if (NpDirectActive() && gCfg.directUsage && !v) {
+        NPLOG(@"[LAYER] setFramebufferOnly:NO → 强制 YES（directUsage=true）");
         v = YES;
     }
     orig_setFramebufferOnly(self, _cmd, v);
@@ -712,9 +750,29 @@ static void (*orig_setDisplaySyncMVK)(id, SEL, BOOL);
 static void Np_setDisplaySyncMVK(id self, SEL _cmd, BOOL v)
 {
     gLayerDisplaySync = v ? 1 : 0;
-    NPLOG(@"[LAYER] setDisplaySyncEnabledMVK:%d%s", v, (gCfg.noVsync ? @" → 强制 NO" : @""));
+    NPLOG(@"[LAYER] setDisplaySyncEnabledMVK:%d%@", v, (gCfg.noVsync ? @" → 强制 NO" : @""));
     if (gCfg.enabled && !gCfg.probe && gCfg.noVsync) v = NO;
     orig_setDisplaySyncMVK(self, _cmd, v);
+}
+
+static void (*orig_setContentsScale)(id, SEL, CGFloat);
+static void Np_setContentsScale(id self, SEL _cmd, CGFloat s)
+{
+    gLayerContentsScale = (double)s;
+    CGFloat want = s;
+    if (NpDirectActive() && gCfg.forceContentsScale) {
+        @try {
+            CGFloat ns = [UIScreen mainScreen].nativeScale;
+            if (ns > 0 && fabs(ns - s) > 0.001) {
+                NPLOG(@"[LAYER] setContentsScale:%.2f → 强制 %.2f (= UIScreen.nativeScale)", (double)s, (double)ns);
+                want = ns;
+            }
+        } @catch (NSException *e) { (void)e; }
+    } else {
+        static int logged = 0;
+        if (logged++ < 3) NPLOG(@"[LAYER] setContentsScale:%.2f", (double)s);
+    }
+    orig_setContentsScale(self, _cmd, want);
 }
 
 static NSInteger (*orig_maxFPS)(id, SEL);
@@ -731,33 +789,23 @@ static NSInteger Np_maximumFramesPerSecond(id self, SEL _cmd)
 static void NpApplyConfig(BOOL firstTime)
 {
     NpComputePlan();
-    NpRefreshScreenSize();
-
-    int tw, th; NpTargetExtent(&tw, &th);
-    gPollExtentW  = tw;
-    gPollExtentH  = th;
-    gPollExtentWanted = (gCfg.enabled && !gCfg.probe && gCfg.resMode != NpResModeNative);
 
     NPLOG(@"──────────── 应用配置 (%@) ────────────", firstTime ? @"首次" : @"热重载");
     NPLOG(@"开关①帧率  : frameRate=%d%@", gCfg.frameRate, (gCfg.frameRate <= 0 ? @" (不改)" : @""));
     if (gCfg.effFps > 0)
         NPLOG(@"             VSync 节拍 %dHz(%dµs) ÷ 分频器 %d → 目标 %d fps；引擎自身 fps 字节保持原值（逻辑步进不动）",
               gCfg.effPacerHz, 1000000 / gCfg.effPacerHz, gCfg.effDivisor, gCfg.effPacerHz / gCfg.effDivisor);
-    NPLOG(@"开关②分辨率: %@ → 渲染 %dx%d%s",
-          (gCfg.resMode == NpResModeNative ? @"native"
-             : (gCfg.resMode == NpResModeScale ? [NSString stringWithFormat:@"比例 %.3f", gCfg.resScale]
-                                               : [NSString stringWithFormat:@"固定 %dx%d", gCfg.resW, gCfg.resH])),
-          tw, th,
-          (gNativeW <= 0 ? @"  (屏幕信息未就绪，等首帧后再判定)"
-                         : (NpIsNativeResolution() ? @"  = 原生像素 → 期望 Metal HUD 显示 Direct"
-                                                   : @"  ≠ 原生像素 → Metal HUD 会显示 Composited")));
+
+    const char *mode = (gCfg.resMode == NpResModeNative ? "native(不动 extent)"
+                        : (gCfg.resMode == NpResModeScale ? "按引擎 extent × 比例" : "固定分辨率"));
+    NPLOG(@"开关②分辨率: %s%@", mode, NpDirectActive() ? @"；直写友好模式=ON" : @"；直写友好模式=off");
 
     if (!gCfg.enabled) { NPLOG(@"enabled=false → 不介入（重启游戏可完全恢复）"); return; }
     if (gCfg.probe)    { NPLOG(@"probe=true → 只观察不修改"); return; }
 
     if (gCfg.effPacerHz > 0) NpApplyPacerPeriod(gCfg.effPacerHz);
     if (!gInitThunkHooked && gCfg.effDivisor > 0)
-        NPLOG(@"ℹ️ Init thunk 未 hook → 分频器走轮询降级（首个 swapchain 可能仍是旧值）");
+        NPLOG(@"ℹ️ Init thunk 未 hook → 分频器走轮询降级（1 秒粒度）");
     NpPollNuCCSys();
 }
 
@@ -768,47 +816,68 @@ static void *NpStatThread(void *arg)
     (void)arg;
     uint64_t frames = 0;
     NSTimeInterval lastT = [NSDate timeIntervalSinceReferenceDate];
-    BOOL firstPass = YES;
+    NSTimeInterval lastStat = lastT;
+    BOOL geomLogged = NO;
+    int ticks = 0;
 
     for (;;) {
-        int win = (gCfg.statSeconds > 0) ? gCfg.statSeconds : 5;
-        sleep((unsigned)win);
+        sleep(1);                                   // 1 秒轮询（兜底分频器/配置热重载）
         if (!gCfg.enabled) continue;
-
-        uint64_t now = gFrameCount;
-        NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
-        double dt = t - lastT;
-        uint64_t delta = now - frames;
-        double fps = (dt > 0.1) ? (double)delta / dt : 0.0;
-        frames = now; lastT = t;
-
-        if (firstPass) {
-            firstPass = NO;
-            NpRefreshScreenSize();
-            NSInteger panelMax = 0;
-            @try {
-                UIScreen *sc = [UIScreen mainScreen];
-                if ([sc respondsToSelector:@selector(maximumFramesPerSecond)]) panelMax = sc.maximumFramesPerSecond;
-            } @catch (NSException *e) { (void)e; }
-            NPLOG(@"环境: %@ / iOS %@   面板最大刷新率 %ldHz   nativeBounds %dx%d px   bundle=%@",
-                  UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion,
-                  (long)panelMax, gNativeW, gNativeH, [NSBundle mainBundle].bundleIdentifier);
-            if (panelMax > 0 && gCfg.effPacerHz > panelMax)
-                NPLOG(@"⚠️ 目标节拍 %dHz 高于面板 %ldHz —— 本机物理上限就是 %ldfps，多余的帧会被丢",
-                      gCfg.effPacerHz, (long)panelMax, (long)panelMax);
-        }
-
-        NPLOG(@"[STAT] 实测 %.1f fps (%llu 帧 / %.1fs) · drawableSize=%dx%d · layer(opaque=%d fbOnly=%d vsync=%d) · 分频器=%d 节拍=%dHz · %@",
-              fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,
-              gLayerOpaque, gLayerFramebufferOnly, gLayerDisplaySync,
-              gCfg.effDivisor, gCfg.effPacerHz,
-              (gNativeW <= 0 ? @"?" : (NpIsNativeResolution() ? @"原生分辨率" : @"缩放分辨率")));
+        ticks++;
 
         NpPollNuCCSys();
 
+        // 首帧后的几何快照（主线程执行，避免 UIKit 线程问题）
+        if (!geomLogged && ticks >= 2) {
+            geomLogged = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    UIWindow *win = nil;
+                    if (@available(iOS 13.0, *)) {
+                        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                                if (w.isKeyWindow) { win = w; break; }
+                            }
+                            if (win) break;
+                        }
+                    }
+                    if (!win) win = UIApplication.sharedApplication.keyWindow;
+                    if (win)
+                        NPLOG(@"[GEO/Win] keyWindow bounds=%.0fx%.0f pt scene=%@", win.bounds.size.width,
+                              win.bounds.size.height, NSStringFromClass(win.windowScene.class) ?: @"-");
+                    CALayer *root = win.layer;
+                    if (root) NpLogGeometry(root, "window-root");
+                } @catch (NSException *e) { (void)e; }
+            });
+        }
+
+        if (gInitThunkCalls == 0 && gSwapchainCount > 0 && ticks == 5)
+            NPLOG(@"ℹ️ 已创建 %d 个 swapchain，但 nummRender::Init(0x4C3BA0) 一次都没被调用 → 分频器改由轮询直写 nummRender+0x9C",
+                  gSwapchainCount);
+
+        int windowSec = (gCfg.statSeconds > 0) ? gCfg.statSeconds : 5;
+        NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
+        if (t - lastStat < (double)windowSec) continue;
+
+        uint64_t now = gFrameCount;
+        double dt = t - lastStat;
+        uint64_t delta = now - frames;
+        double fps = (dt > 0.1) ? (double)delta / dt : 0.0;
+        frames = now; lastStat = t;
+        (void)lastT;
+
+        NPLOG(@"[STAT] 实测 %.1f fps (%llu 帧 / %.1fs) · drawableSize=%dx%d · layer(opaque=%d fbOnly=%d vsync=%d contentsScale=%.1f) · "
+              @"分频器=%d 节拍=%dHz · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
+              fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,
+              gLayerOpaque, gLayerFramebufferOnly, gLayerDisplaySync, gLayerContentsScale,
+              gCfg.effDivisor, gCfg.effPacerHz,
+              gLastOrigW, gLastOrigH, gLastNewW, gLastNewH,
+              gInitThunkCalls, gSetFrameRateCalls);
+
         struct stat st;
         if (stat(NpCfgPath().fileSystemRepresentation, &st) == 0 && st.st_mtime != gCfgMTime) {
-            NPLOG(@"🔄 检测到配置变更，重新加载（分辨率/节拍类改动建议重启游戏以完全生效）");
+            NPLOG(@"🔄 检测到配置变更，重新加载（extent/节拍类改动建议重启游戏以完全生效）");
             NpConfigLoad();
             NpApplyConfig(NO);
         }
@@ -833,7 +902,6 @@ static uintptr_t NpFindGameImage(char *outName, size_t outNameLen)
 
 static void NpInstall(void)
 {
-    gLogFD = -1; gLogReady = NO;
     NpLogOpen();
     NpConfigLoad();
     if (gCfg.captureStderr) NpRedirectStderr();
@@ -851,7 +919,7 @@ static void NpInstall(void)
               NP_TARGET_IMAGE_NAME);
         return;
     }
-    NPLOG(@"✅ 目标映像: %s", imgName);
+    NPLOG(@"✅ 目标映像: %@", [NSString stringWithUTF8String:imgName]);
     NPLOG(@"   加载基址: 0x%lx", (unsigned long)gBase);
 
     // ---- 指纹自检 ----
@@ -869,8 +937,8 @@ static void NpInstall(void)
         NPLOG(@"指纹自检: Init=%d Pacer=%d vkCreateSwapchain=%d SetFrameRate=%d  (全 1 = 匹配 1.0.1)",
               okT, okP, okV, okS);
         if (!(okT && okP && okV && okS))
-            NPLOG(@"   原始字节: Init=[%@] Pacer=[%@]", np_hexdump(np_at(RVA_INIT_THUNK), 12),
-                  np_hexdump(np_at(RVA_PACER_THREAD), 16));
+            NPLOG(@"   原始字节: Init=[%@] Pacer=[%@]",
+                  np_hexdump(np_at(RVA_INIT_THUNK), 12), np_hexdump(np_at(RVA_PACER_THREAD), 16));
     }
 
     BOOL hookOK = NpResolveHookEngine();
@@ -882,7 +950,7 @@ static void NpInstall(void)
             NPLOG(@"%@ hook nummRender::Init 调用点 (trampoline=%p)", gInitThunkHooked ? @"✅" : @"❌",
                   (void *)gOrigInitThunk);
         } else {
-            NPLOG(@"⚠️ Init thunk 指纹不匹配 → 跳过（分频器改动失效）");
+            NPLOG(@"⚠️ Init thunk 指纹不匹配 → 跳过（分频器改动改走轮询）");
         }
 
         if (np_mem_eq(np_at(RVA_SET_FRAMERATE), fpSetFps, sizeof(fpSetFps))) {
@@ -905,12 +973,13 @@ static void NpInstall(void)
     Class metalLayer = objc_getClass("CAMetalLayer");
     if (metalLayer) {
         int n = 0;
-        n += NpSwizzle(metalLayer, @selector(nextDrawable),             (IMP)Np_nextDrawable,       (IMP *)&orig_nextDrawable);
-        n += NpSwizzle(metalLayer, @selector(setDrawableSize:),         (IMP)Np_setDrawableSize,    (IMP *)&orig_setDrawableSize);
-        n += NpSwizzle(metalLayer, @selector(setOpaque:),               (IMP)Np_setOpaque,          (IMP *)&orig_setOpaque);
-        n += NpSwizzle(metalLayer, @selector(setFramebufferOnly:),      (IMP)Np_setFramebufferOnly, (IMP *)&orig_setFramebufferOnly);
-        n += NpSwizzle(metalLayer, @selector(setDisplaySyncEnabledMVK:), (IMP)Np_setDisplaySyncMVK, (IMP *)&orig_setDisplaySyncMVK);
-        NPLOG(@"CAMetalLayer hooks: %d/5 安装完成", n);
+        n += NpSwizzle(metalLayer, @selector(nextDrawable),              (IMP)Np_nextDrawable,       (IMP *)&orig_nextDrawable);
+        n += NpSwizzle(metalLayer, @selector(setDrawableSize:),          (IMP)Np_setDrawableSize,    (IMP *)&orig_setDrawableSize);
+        n += NpSwizzle(metalLayer, @selector(setOpaque:),                (IMP)Np_setOpaque,          (IMP *)&orig_setOpaque);
+        n += NpSwizzle(metalLayer, @selector(setFramebufferOnly:),       (IMP)Np_setFramebufferOnly, (IMP *)&orig_setFramebufferOnly);
+        n += NpSwizzle(metalLayer, @selector(setDisplaySyncEnabledMVK:), (IMP)Np_setDisplaySyncMVK,  (IMP *)&orig_setDisplaySyncMVK);
+        n += NpSwizzle(metalLayer, @selector(setContentsScale:),         (IMP)Np_setContentsScale,   (IMP *)&orig_setContentsScale);
+        NPLOG(@"CAMetalLayer hooks: %d/6 安装完成", n);
     } else {
         NPLOG(@"⚠️ CAMetalLayer 类不存在（Metal 尚未加载）→ 图层修正/统计不可用");
     }
@@ -925,7 +994,7 @@ static void NpInstall(void)
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&th, &at, NpStatThread, NULL) == 0) {
         pthread_setname_np("NarutoPlus-Stat");
-        NPLOG(@"✅ 统计线程已启动（每 %d 秒一行 STAT）", gCfg.statSeconds);
+        NPLOG(@"✅ 统计线程已启动（1 秒轮询；每 %d 秒一行 STAT）", gCfg.statSeconds);
     }
     pthread_attr_destroy(&at);
 
@@ -937,9 +1006,6 @@ static void NpInstall(void)
 __attribute__((constructor))
 static void NarutoPlusInit(void)
 {
-    gBootTs = [NSDate timeIntervalSinceReferenceDate];
-    NpLogOpen();
-    NpLog(@"── NarutoPlus 载入 (constructor) ──");
     @try {
         NpInstall();
     } @catch (NSException *e) {

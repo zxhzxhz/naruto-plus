@@ -6,6 +6,8 @@
   "pacerHz": 0,
   "logicFps": 0,
   "forceDirect": true,
+  "directUsage": false,
+  "forceContentsScale": false,
   "noVsync": false,
   "captureStderr": true,
   "statSeconds": 5
