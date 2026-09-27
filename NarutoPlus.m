@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.8"
+#define NP_VERSION              @"1.9"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -235,6 +235,7 @@ static void     NpEnforceEngineState(const char *why);
 static uint8_t  NpEngineFpsByte(void);
 static uint32_t NpTimeBaseLive(void);
 static void     NpApplyVsyncClock(void);
+static void     NpApplyStepBase(void);
 
 #pragma mark - ============================ 配置 ============================
 
@@ -258,6 +259,7 @@ typedef struct {
     BOOL        dumpPointers;       // 诊断：把引擎关键函数指针映射成 RVA 打进日志（默认开，只读）
     BOOL        clockCompensate;    // 主时钟补偿（默认开）
     int         vsyncCbHz;          // per-vsync 回调目标频率；0 = 自动 60Hz（引擎原始设计节拍）
+    int         stepBase;           // ★ 只改「步进计算点」的常量（0 = 不动，120fps 用 750，60fps 用 1500）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -299,6 +301,7 @@ static id NpCfgDefaultJSON(void)
         @"dumpPointers": @YES,                // 诊断：打印引擎函数指针 RVA（只读，用于定位帧管线）
         @"clockCompensate": @YES,             // 主时钟补偿
         @"vsyncCbHz": @0,                     // per-vsync 回调频率；0=自动 60Hz（原始设计节拍）
+        @"stepBase": @0,                      // 步进基线：只补丁 6 处步进点（120fps→750；0=不动）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -441,6 +444,7 @@ static void NpConfigLoad(void)
     if (j[@"dumpPointers"])       gCfg.dumpPointers       = [j[@"dumpPointers"] boolValue];
     if (j[@"clockCompensate"])    gCfg.clockCompensate    = [j[@"clockCompensate"] boolValue];
     if (j[@"vsyncCbHz"])          gCfg.vsyncCbHz          = [j[@"vsyncCbHz"] intValue];
+    if (j[@"stepBase"])           gCfg.stepBase           = [j[@"stepBase"] intValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -667,6 +671,7 @@ static void NpEnforceEngineState(const char *why)
     }
 
     NpApplyVsyncClock();
+    NpApplyStepBase();
 
     uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
     if (rend > 0x100000000ULL && gCfg.effDivisor > 0) {
@@ -748,6 +753,70 @@ static BOOL NpApplyPacerPeriod(int pacerHz)
           ok ? @"✅" : @"⚠️", oldPeriod, period, pacerHz, cur0, cur1, cur2, a0, a1, a2);
     if (ok) NPLOG(@"   ↳ MOVZ W24,#%u  MOVZ W25,#%u  MOVN X26,#%u(=-%u)", period - 1, period, period - 1, period);
     return ok;
+}
+
+#pragma mark - ============================ 步进基线按点补丁（★ 关键：不动全局时间基） ============================
+//
+// 引擎的 6 处「步进/速率」计算都是同一形状：
+//     ADRL X8, dword_100D59FC8(DEFAULT)   ;  LDR W<reg>,[X8]   ;  LDRB W9,[nuccSys+0x992]
+//     UDIV W<reg>, W<reg>, W9             ;  步进 = 时间基 ÷ fps字节
+// 而 dword_100D59FC8 同时被 60+ 处代码读取（含「秒→单位」的计时器换算）。
+// 所以我们**不动全局**，只把上面每条 LDR 换成常量 MOV ⇒ 运动/粒子/时间→帧 的步进按倍率缩放，
+// 而游戏自身的计时器（用全局做换算）保持引擎原值不变。
+//
+//   stepBase = 750  → 步进 = 750÷30 = 25 单位/帧 × 120 帧/秒 = 3000 单位/秒 = 1.00×
+//   stepBase = 1500 → 步进 = 50 单位/帧 × 60 帧/秒  = 3000 单位/秒 = 1.00×（60fps 档）
+//
+typedef struct { uint32_t rva; uint8_t reg; uint32_t orig; const char *desc; } NpStepSite;
+
+static const NpStepSite kStepSites[] = {
+    {0x4D4864u,  8, 0xB9400108u, "运动/位移步进 sub_1004D4838"},
+    {0x4F83B4u,  8, 0xB9400108u, "粒子帧数   sub_1004F836C"},
+    {0x51F99Cu,  8, 0xB9400108u, "时间→帧    sub_10051F96C"},
+    {0x5205E8u,  8, 0xB9400108u, "时间→帧×n  sub_1005205C8"},
+    {0x520208u, 22, 0xB9400116u, "子步进A    sub_1005200EC"},
+    {0x4F077Cu, 23, 0xB9400117u, "子步进B    sub_1004F066C"},
+};
+#define NP_STEP_SITE_COUNT (sizeof(kStepSites) / sizeof(kStepSites[0]))
+
+static uint32_t gStepBaseApplied = 0;
+
+static void NpApplyStepBase(void)
+{
+    if (!gBase || !gCfg.enabled || gCfg.probe) return;
+
+    uint32_t want = (gCfg.stepBase > 0 && gCfg.stepBase <= 0xFFFF) ? (uint32_t)gCfg.stepBase : 0;
+    if (want == gStepBaseApplied) return;
+
+    int patchedN = 0, restoredN = 0, failedN = 0;
+    for (size_t i = 0; i < NP_STEP_SITE_COUNT; i++) {
+        uintptr_t a = gBase + kStepSites[i].rva;
+        uint32_t cur = np_rd32(a);
+        uint32_t tgt = 0x52800000u | (want << 5) | (uint32_t)kStepSites[i].reg;
+        if (want == 0) {                                     // 还原
+            if (cur == kStepSites[i].orig) continue;
+            if (NpPatchCode((void *)a, &kStepSites[i].orig, 4)) restoredN++;
+            else failedN++;
+            continue;
+        }
+        if (cur == kStepSites[i].orig) {
+            if (NpPatchCode((void *)a, &tgt, 4)) patchedN++;
+            else failedN++;
+        } else if (cur == tgt) {
+            patchedN++;
+        } else {
+            NPLOG(@"❌ stepBase 补丁点 0x%x 指纹不符（当前 0x%08x，期望 0x%08x）→ 跳过",
+                  kStepSites[i].rva, cur, kStepSites[i].orig);
+            failedN++;
+        }
+    }
+    if (failedN == 0) gStepBaseApplied = want;
+
+    if (want == 0)
+        NPLOG(@"%@ [STEP] 步进基线还原为引擎默认（全局时间基 %u）", failedN ? @"⚠️" : @"✅", NpTimeBaseLive());
+    else
+        NPLOG(@"%@ [STEP] 步进基线 = %u（补丁 %d 处 / 失败 %d）：每帧步进 = %u ÷ fps字节 = %u 单位",
+              failedN ? @"⚠️" : @"✅", want, patchedN, failedN, want, want / (NpEngineFpsByte() ? NpEngineFpsByte() : 30));
 }
 
 #pragma mark - ============================ 游戏主时钟补偿（关键） ============================
@@ -1085,13 +1154,14 @@ static void NpApplyConfig(BOOL firstTime)
         uint32_t tbLive   = NpTimeBaseLive();
         uint32_t tb       = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase : tbLive;
         uint8_t  eb       = (liveByte > 0) ? liveByte : 30;             // 引擎未初始化时按 30 预估
-        uint32_t step     = (eb > 0) ? (tb / eb) : 0;
+        uint32_t effBase  = (gCfg.stepBase > 0) ? (uint32_t)gCfg.stepBase : tb;
+        uint32_t step     = (eb > 0) ? (effBase / eb) : 0;
         double   tick     = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
                             ? (double)gCfg.effPacerHz / (double)gCfg.effDivisor : 0;
         double   flowA    = tick * (double)step / (double)TIME_BASE_DEFAULT;  // 引擎另有固定 3000 实时基准
         double   flowB    = (eb > 0) ? tick / (double)eb : 0;                 // 该全局本身就是单位基准
-        NPLOG(@"步进: 时间基=%u(实读 %u)  fps字节=%u(实读 %u) → 单帧 %u 单位 | 帧唤醒 %.0f 次/秒",
-              tb, tbLive, eb, liveByte, step, tick);
+        NPLOG(@"步进: 全局时间基=%u(实读 %u, %@)  步进基准=%u  fps字节=%u(实读 %u) → 单帧 %u 单位 | 帧唤醒 %.0f 次/秒",
+              tb, tbLive, (tb == tbLive) ? @"未改" : @"已改", effBase, eb, liveByte, step, tick);
         {
             double animRate = (double)step * tick;                   // 动画/逻辑：单位/秒
             double clkInc   = (double)tb / (double)((eb > 0) ? (eb * ((gCfg.effDivisor > 0) ? gCfg.effDivisor : 1)) : 60);
@@ -1106,9 +1176,9 @@ static void NpApplyConfig(BOOL firstTime)
         }
         if (gCfg.effEngineFps > 0)
             NPLOG(@"ℹ️ 同时按 engineFps=%d 直写 fps 字节（引擎校验上限 60；写 >60 会进 3D 场景闪退）", gCfg.effEngineFps);
-        if (gCfg.timeBase <= 0 && gCfg.frameRate > 30)
-            NPLOG(@"💡 若模型A成立：把 timeBase 设为 %u（= %u×30÷%d）即可在 fps 字节不动的前提下把时间流速拉回 1.0×",
-                  (unsigned)(TIME_BASE_DEFAULT * 30u / (unsigned)gCfg.frameRate), TIME_BASE_DEFAULT, gCfg.frameRate);
+        if (gCfg.stepBase <= 0 && gCfg.frameRate > 30)
+            NPLOG(@"💡 想让运动/动画也 1.0×：把 stepBase 设为 %u（= 3000×30÷%d，只改步进点、不动全局时间基、不影响游戏计时器）",
+                  (unsigned)(TIME_BASE_DEFAULT * 30u / (unsigned)gCfg.frameRate), gCfg.frameRate);
     }
 
     if (!gCfg.enabled) { NPLOG(@"enabled=false → 不介入（重启游戏可完全恢复）"); return; }
