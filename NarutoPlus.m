@@ -226,6 +226,10 @@ static BOOL np_mem_eq(const void *p, const void *ref, size_t n)
     return p && memcmp(p, ref, n) == 0;
 }
 
+// 前向声明（定义在下方；配置/日志代码会先用到）
+static void    NpEnforceEngineState(const char *why);
+static uint8_t NpEngineFpsByte(void);
+
 #pragma mark - ============================ 配置 ============================
 
 typedef enum { NpResModeNative = 0, NpResModeScale = 1, NpResModeFixed = 2 } NpResMode;
