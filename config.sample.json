@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "probe": false,
+  "frameRate": 120,
+  "resolution": "native",
+  "pacerHz": 0,
+  "logicFps": 0,
+  "forceDirect": true,
+  "noVsync": false,
+  "captureStderr": true,
+  "statSeconds": 5
+}

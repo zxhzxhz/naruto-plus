@@ -1,0 +1,106 @@
+name: Build NarutoPlus dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      SDK_NAME: "iPhoneOS15.6"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fakeroot curl git xz-utils libtinfo6 libxml2 make perl file python3
+
+      - name: 安装 Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: 安装 Linux iOS 工具链（轻量版，不含 Swift）
+        run: |
+          mkdir -p "$THEOS/toolchain"
+          curl -fsSL -o /tmp/tc.tar.xz \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+          tar -xJf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version | head -3
+
+      - name: 安装 iOS SDK ${{ env.SDK_NAME }}
+        run: |
+          set -x
+          if ! "$THEOS/bin/install-sdk" "$SDK_NAME"; then
+            echo "install-sdk 失败，改用直连下载"
+            mkdir -p "$THEOS/sdks"
+            TAG=$(curl -s https://api.github.com/repos/theos/sdks/releases/latest \
+                  | grep -m1 '"tag_name"' | cut -d'"' -f4)
+            echo "release tag = $TAG"
+            curl -fL "https://github.com/theos/sdks/releases/download/${TAG}/${SDK_NAME}.sdk.tar.xz" \
+              | tar -xJ -C "$THEOS/sdks"
+          fi
+          ls -1 "$THEOS/sdks"
+
+      # ---------- 首选：Theos 仅 arm64 ----------
+      - name: 编译 (Theos, 仅 arm64)
+        id: build_arm64
+        continue-on-error: true
+        run: |
+          make clean || true
+          make -j4 ARCHS="arm64"
+          find .theos -name '*.dylib' -print
+
+      # ---------- 兜底 1：Theos fat (arm64+arm64e) ----------
+      - name: 编译 (Theos, arm64+arm64e)
+        id: build_fat
+        if: steps.build_arm64.outcome != 'success'
+        continue-on-error: true
+        run: |
+          make clean || true
+          make -j4 ARCHS="arm64 arm64e"
+          find .theos -name '*.dylib' -print
+
+      # ---------- 兜底 2：apt clang + ld64.lld 直编 ----------
+      - name: 编译 (clang + ld64.lld 兜底)
+        id: build_lld
+        if: steps.build_arm64.outcome != 'success' && steps.build_fat.outcome != 'success'
+        run: |
+          sudo apt-get install -y -qq clang lld
+          SDK_DIR="$THEOS/sdks/${SDK_NAME}.sdk"
+          clang -target arm64-apple-ios14.0 \
+                -isysroot "$SDK_DIR" \
+                -fuse-ld=lld -dynamiclib -fobjc-arc -O2 -w -Wno-error \
+                -framework Foundation -framework UIKit -framework QuartzCore \
+                -install_name @rpath/NarutoPlus.dylib \
+                -o NarutoPlus.dylib NarutoPlus.m
+
+      - name: 收集产物
+        run: |
+          set -e
+          if [ ! -f NarutoPlus.dylib ]; then
+            SRC=$(find .theos -name '*.dylib' -not -path '*dSYM*' \
+                    -not -path '*/arm64/*' -not -path '*/arm64e/*' | head -1)
+            [ -n "$SRC" ] || SRC=$(find .theos -name '*.dylib' -not -path '*dSYM*' | head -1)
+            [ -n "$SRC" ] || { echo "❌ 三种编译方式均未产出 dylib"; exit 1; }
+            echo "选取: $SRC"
+            cp "$SRC" NarutoPlus.dylib
+          fi
+          ls -lh NarutoPlus.dylib
+          file NarutoPlus.dylib || true
+          sha256sum NarutoPlus.dylib
+
+      - name: 校验 Mach-O
+        run: python3 ci_verify.py NarutoPlus.dylib
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NarutoPlus-dylib
+          path: NarutoPlus.dylib
+          if-no-files-found: error
+          retention-days: 90

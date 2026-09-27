@@ -1,0 +1,5 @@
+dist/
+artifact/
+*.dylib
+__pycache__/
+.theos/
