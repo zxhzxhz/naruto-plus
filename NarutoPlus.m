@@ -83,6 +83,9 @@
 #import <libkern/OSCacheControl.h>
 #import <execinfo.h>
 #import <signal.h>
+#if !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700        // ucontext_t 需要
+#endif
 #import <ucontext.h>
 
 #ifndef PAGE_SIZE
@@ -214,6 +217,10 @@ static void NpLog(NSString *fmt, ...)
 #pragma mark - ============================ 崩溃黑匣子 / 会话追踪 ============================
 
 static int gCrashFD = -1;
+
+// 前向声明（NpCrashInit 里注册它们）
+static void NpSignalHandler(int sig, siginfo_t *info, void *uap);
+static void NpUncaughtExceptionHandler(NSException *e);
 
 static NSString *NpDocPath(NSString *name)
 {
@@ -615,7 +622,7 @@ static void NpUncaughtExceptionHandler(NSException *e)
     NSArray *sym = e.callStackSymbols;
     for (NSUInteger i = 0; i < sym.count && i < 40; i++) {
         n = snprintf(buf, sizeof(buf), "  %s
-", [sym[i] UTF8String]);
+", [sym[i] UTF8String] ?: "?");
         NpWriteCrashFd(buf, (size_t)MAX(n, 0));
     }
 }
