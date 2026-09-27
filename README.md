@@ -211,6 +211,7 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | 版本 | 内容 |
 |---|---|
 | v1.0 | 首版：VSync 节拍补丁 + Init 分频器改写 + swapchain 分辨率/直写属性 hook + 图层统计；配置双开关 + 热重载 |
+| **v1.5.1** | 修 v1.5 引入的启动崩溃：`NpConfigLoad()` 里新增的「模型预测」日志块在 `gBase` 尚未赋值时就调用 `NpEngineFpsByte()`，解引用 `0 + 0xFDEC00` 野指针 → 启动即闪退（日志只剩 1 行配置行）。修法：`NpEngineFpsByte()`/新增 `NpTimeBaseLive()` 加 `gBase` 守卫，并把预测日志整块**移到 `NpApplyConfig()`**（映像已就位后执行） |
 | **v1.5** | 找到真正的时间基杠杆：步进公式里的 `3000` 不是立即数，而是全局 `dword_100D59FC8`（`ADRL; LDR W8,[X8]; LDRB W9,[nuccSys+0x992]; UDIV`，被 60+ 处代码引用）。新增 `timeBase` 配置直写该全局（`__TEXT,__const` 走 vm_protect），可在 **fps 字节保持游戏原值 30、绝不触发 >60 闪退** 的前提下把步进改成 1/120；`engineFps` 语义改为「0 = 不碰」；日志同时打印两条模型的流速预测（A：引擎另有固定 3000 实时基准 → 改时间基有效；B：全局即单位基准 → 改时间基无效） |
 | **v1.4** | 新增 `nuccSys::UpdateRenderExtent` hook（守卫 `60/fps=0` 的落地）+ `allowEngineFpsOver60` 危险档：默认仍钳 60；开启后允许把 fps 字节写成 120（配合 UpdateRenderExtent 守卫做「120fps + 步进 1/120 = 时间流速 1.0×」的验证）。同时给 `NpEnforceEngineState` 加了空状态早退 |
 | **v1.3** | **止血 + 模型自证**：1) 设备实测「进 3D 场景闪退」的根因是 fps 字节>60 ⇒ `engineFps` 硬钳到 ≤60（引擎自带校验 `fps>60 \|\| 60%fps → 60`，且 60/fps 会算成 0 落进 `nuccSys+0x4B8`），渲染帧率不受影响，仍是「节拍×分频器」；2) `[STAT]` 新增 `时间流速预测 = 实测fps ÷ 引擎字节`，用于一次性判定步进模型（自然模型预测 2x / 备选模型预测 1x） |

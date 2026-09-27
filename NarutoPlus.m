@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.5"
+#define NP_VERSION              @"1.5.1"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -227,8 +227,9 @@ static BOOL np_mem_eq(const void *p, const void *ref, size_t n)
 }
 
 // 前向声明（定义在下方；配置/日志代码会先用到）
-static void    NpEnforceEngineState(const char *why);
-static uint8_t NpEngineFpsByte(void);
+static void     NpEnforceEngineState(const char *why);
+static uint8_t  NpEngineFpsByte(void);
+static uint32_t NpTimeBaseLive(void);
 
 #pragma mark - ============================ 配置 ============================
 
@@ -443,40 +444,6 @@ static void NpConfigLoad(void)
              : (gCfg.resMode == NpResModeScale ? [NSString stringWithFormat:@"scale %.3f", gCfg.resScale]
                                                : [NSString stringWithFormat:@"%dx%d", gCfg.resW, gCfg.resH])),
           gCfg.forceDirect, gCfg.directUsage, gCfg.forceContentsScale, gCfg.noVsync, gCfg.pacerHz, gCfg.logicFps);
-    {
-        uint8_t curByte = NpEngineFpsByte();
-        uint32_t tb = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase
-                                          : (gBase ? np_rd32(gBase + RVA_TIME_BASE_GLOBAL) : TIME_BASE_DEFAULT);
-        if (curByte == 0) curByte = 30;                       // 引擎尚未初始化
-        uint32_t step = tb / curByte;
-        double ticksPerSec = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
-                             ? (double)gCfg.effPacerHz / (double)gCfg.effDivisor : 0;
-        // 模型A：引擎另有「3000 单位 = 1 秒」的固定实时基准 ⇒ 时间流速 = 唤醒次数 × 步进/3000
-        // 模型B：该全局本身就是单位基准           ⇒ 时间流速 = 唤醒次数 ÷ fps字节
-        double flowA = ticksPerSec * (double)step / 3000.0;
-        double flowB = (curByte > 0) ? ticksPerSec / (double)curByte : 0;
-        NPLOG(@"步进/时间基: 时间基=%u fps字节=%u → 单帧步进 %u 单位 | 唤醒 %.0f 次/秒", tb, curByte, step, ticksPerSec);
-        NPLOG(@"时间流速预测: 模型A(固定3000实时基准)=%.2fx   模型B(全局即单位基准)=%.2fx   ← 请与手感对照并把本行回传",
-              flowA, flowB);
-        if (gCfg.timeBase <= 0 && gCfg.frameRate > 30)
-            NPLOG(@"💡 若模型A成立：把 timeBase 设为 %u（= 3000×30÷%d）即可在 fps 字节不动的前提下让时间流速回到 1.0×",
-                  (unsigned)(TIME_BASE_DEFAULT * 30u / (unsigned)gCfg.frameRate), gCfg.frameRate);
-        (void)step;
-    }
-    {
-        int ef = (gCfg.effEngineFps > 0) ? gCfg.effEngineFps : 1;
-        double stepMs = 1000.0 / (double)ef;
-        double ticksPerSec = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
-                             ? (double)gCfg.effPacerHz / (double)gCfg.effDivisor : 0;
-        double flow = (ticksPerSec > 0) ? ticksPerSec * stepMs / 1000.0 : 0;
-        NPLOG(@"逻辑步进: 字节=%d → %u/3000 秒/帧 (%.2f ms/帧) | 唤醒 %.0f 次/秒 | 预计时间流速 %.2fx %@",
-              ef, NUCC_TIME_BASE_PER_SEC / ef, stepMs, ticksPerSec, flow,
-              (flow > 1.05 ? @"← 偏快，把 engineFps 提到与 frameRate 相同即可" :
-               (flow < 0.95 ? @"← 偏慢" : @"← 正常")));
-        if (NUCC_TIME_BASE_PER_SEC % ef)
-            NPLOG(@"⚠️ 3000 %% %d = %u ≠ 0：步进非整数，可能出现节奏抖动（120/60/30/25 均可整除）",
-                  ef, NUCC_TIME_BASE_PER_SEC % ef);
-    }
 }
 
 #pragma mark - ============================ 目标分辨率推导 ============================
@@ -671,9 +638,17 @@ static int64_t NpHook_UpdateRenderExtent(uintptr_t self, void *presetEntry)
     return r;
 }
 
+// 读实时时间基（未拿到映像时返回默认值）
+static uint32_t NpTimeBaseLive(void)
+{
+    if (!gBase) return TIME_BASE_DEFAULT;
+    return np_rd32(gBase + RVA_TIME_BASE_GLOBAL);
+}
+
 // 读当前引擎 fps 字节（仅用于日志）
 static uint8_t NpEngineFpsByte(void)
 {
+    if (!gBase) return 0;                       // 配置加载阶段 gBase 仍为 0，绝不能在此解引用
     uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
     if (inst > 0x100000000ULL) return *(volatile uint8_t *)(inst + OFF_NUCC_FPS_EFFECTIVE);
     return 0;
@@ -928,6 +903,28 @@ static void NpApplyConfig(BOOL firstTime)
                         : (gCfg.resMode == NpResModeScale ? "按引擎 extent × 比例" : "固定分辨率"));
     NPLOG(@"开关②分辨率: %s%@", mode, NpDirectActive() ? @"；直写友好模式=ON" : @"；直写友好模式=off");
 
+    // ── 步进 / 时间基 / 时间流速预测（此处 gBase 已就绪，可安全读引擎内存） ──
+    {
+        uint8_t  liveByte = NpEngineFpsByte();
+        uint32_t tbLive   = NpTimeBaseLive();
+        uint32_t tb       = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase : tbLive;
+        uint8_t  eb       = (liveByte > 0) ? liveByte : 30;             // 引擎未初始化时按 30 预估
+        uint32_t step     = (eb > 0) ? (tb / eb) : 0;
+        double   tick     = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
+                            ? (double)gCfg.effPacerHz / (double)gCfg.effDivisor : 0;
+        double   flowA    = tick * (double)step / (double)TIME_BASE_DEFAULT;  // 引擎另有固定 3000 实时基准
+        double   flowB    = (eb > 0) ? tick / (double)eb : 0;                 // 该全局本身就是单位基准
+        NPLOG(@"步进: 时间基=%u(实读 %u)  fps字节=%u(实读 %u) → 单帧 %u 单位 | 帧唤醒 %.0f 次/秒",
+              tb, tbLive, eb, liveByte, step, tick);
+        NPLOG(@"时间流速预测: 模型A(固定%u实时基准)=%.2fx   模型B(全局即单位基准)=%.2fx   ← 请与实测手感对照",
+              TIME_BASE_DEFAULT, flowA, flowB);
+        if (gCfg.effEngineFps > 0)
+            NPLOG(@"ℹ️ 同时按 engineFps=%d 直写 fps 字节（引擎校验上限 60；写 >60 会进 3D 场景闪退）", gCfg.effEngineFps);
+        if (gCfg.timeBase <= 0 && gCfg.frameRate > 30)
+            NPLOG(@"💡 若模型A成立：把 timeBase 设为 %u（= %u×30÷%d）即可在 fps 字节不动的前提下把时间流速拉回 1.0×",
+                  (unsigned)(TIME_BASE_DEFAULT * 30u / (unsigned)gCfg.frameRate), TIME_BASE_DEFAULT, gCfg.frameRate);
+    }
+
     if (!gCfg.enabled) { NPLOG(@"enabled=false → 不介入（重启游戏可完全恢复）"); return; }
     if (gCfg.probe)    { NPLOG(@"probe=true → 只观察不修改"); return; }
 
@@ -1004,9 +1001,9 @@ static void *NpStatThread(void *arg)
               fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,
               gLayerOpaque, gLayerFramebufferOnly, gLayerDisplaySync, gLayerContentsScale,
               gCfg.effDivisor, gCfg.effPacerHz,
-              (gBase ? np_rd32(gBase + RVA_TIME_BASE_GLOBAL) : 0),
+              NpTimeBaseLive(),
               NpEngineFpsByte(),
-              (NpEngineFpsByte() ? (gBase ? np_rd32(gBase + RVA_TIME_BASE_GLOBAL) : 3000) / NpEngineFpsByte() : 0),
+              (NpEngineFpsByte() ? NpTimeBaseLive() / NpEngineFpsByte() : 0),
               gLastOrigW, gLastOrigH, gLastNewW, gLastNewH,
               gInitThunkCalls, gSetFrameRateCalls);
 
