@@ -550,8 +550,9 @@ static BOOL NpResolveHookEngine(void)
 
 #pragma mark - ============================ 帧率 ============================
 
-// 前向声明：Init / SetFrameRate hook 内会用到（定义在下方）
+// 前向声明（定义在下方，供前面的配置/日志代码使用）
 static void NpEnforceEngineState(const char *why);
+static uint8_t NpEngineFpsByte(void);
 
 typedef int64_t (*InitThunkFn)(int16_t w, int16_t h, uint32_t preset, uint32_t flags, uint32_t divisor);
 static InitThunkFn gOrigInitThunk = NULL;
