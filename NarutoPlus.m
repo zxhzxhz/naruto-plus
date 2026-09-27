@@ -81,6 +81,9 @@
 #import <mach/mach_error.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
+#import <execinfo.h>
+#import <signal.h>
+#import <ucontext.h>
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 16384u
@@ -88,9 +91,11 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.9"
+#define NP_VERSION              @"1.10"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
+#define NP_CRASH_FILENAME       @"NarutoPlus.crash.log"   // 崩溃黑匣子（小文件，便于拉取）
+#define NP_STATE_FILENAME       @"NarutoPlus.state"       // 会话状态（uptime，用于判断异常退出）
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
 
 #define NP_TARGET_IMAGE_NAME    "narutoNext1"
@@ -205,6 +210,57 @@ static void NpLog(NSString *fmt, ...)
 }
 
 #define NPLOG(...) NpLog(__VA_ARGS__)
+
+#pragma mark - ============================ 崩溃黑匣子 / 会话追踪 ============================
+
+static int gCrashFD = -1;
+
+static NSString *NpDocPath(NSString *name)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (dir.length == 0) dir = NSTemporaryDirectory();
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    return [dir stringByAppendingPathComponent:name];
+}
+
+static uint32_t NpRVAByPtrFwd(uintptr_t p);      // 定义在后面，这里先声明
+
+static void NpCrashInit(void)
+{
+    static BOOL inited = NO;
+    if (inited) return;
+    inited = YES;
+    gCrashFD = open(NpDocPath(NP_CRASH_FILENAME).fileSystemRepresentation,
+                    O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_sigaction = NpSignalHandler;
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTRAP};
+    for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) sigaction(sigs[i], &sa, NULL);
+
+    NSSetUncaughtExceptionHandler(&NpUncaughtExceptionHandler);
+    NPLOG(@"崩溃黑匣子已安装（6 类信号 + NSException）→ %@", NP_CRASH_FILENAME);
+}
+
+static void NpSessionBegin(void)
+{
+    NSString *statePath = NpDocPath(NP_STATE_FILENAME);
+    NSString *prev = [NSString stringWithContentsOfFile:statePath encoding:NSUTF8StringEncoding error:NULL];
+    int prevUp = prev ? prev.intValue : -1;
+    NPLOG(@"会话开始: pid=%d 版本=%@ 上次会话存活 %@ 秒%@", getpid(), NP_VERSION,
+          (prevUp >= 0 ? [NSString stringWithFormat:@"%d", prevUp] : @"未知"),
+          (prevUp >= 0 && prevUp < 4) ? @" ⚠️(疑似异常退出/崩溃，见 crash.log)" : @"");
+    [@"0" writeToFile:statePath atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static void NpSessionTick(int uptimeSec)
+{
+    [ [NSString stringWithFormat:@"%d", uptimeSec]
+        writeToFile:NpDocPath(NP_STATE_FILENAME) atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+}
 
 #pragma mark - ============================ 基础工具 ============================
 
@@ -546,6 +602,57 @@ static uint32_t NpRVAByPtr(uintptr_t p)
     if (off == 0 || off >= NP_IMAGE_MAX_RVA) return 0;
     return (uint32_t)off;
 }
+
+static void NpWriteCrashFd(const char *s, size_t n) { if (gCrashFD >= 0) { ssize_t ig = write(gCrashFD, s, n); (void)ig; } }
+
+static void NpUncaughtExceptionHandler(NSException *e)
+{
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "
+[EXCEPTION] %s: %s
+", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?");
+    NpWriteCrashFd(buf, (size_t)MAX(n, 0));
+    NSArray *sym = e.callStackSymbols;
+    for (NSUInteger i = 0; i < sym.count && i < 40; i++) {
+        n = snprintf(buf, sizeof(buf), "  %s
+", [sym[i] UTF8String]);
+        NpWriteCrashFd(buf, (size_t)MAX(n, 0));
+    }
+}
+
+static void NpSignalHandler(int sig, siginfo_t *info, void *uap)
+{
+    char buf[2048];
+    uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
+    ucontext_t *uc = (ucontext_t *)uap;
+    if (uc) {
+        pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+        fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+        sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
+    }
+    int n = snprintf(buf, sizeof(buf),
+                     "
+[SIGNAL] %d addr=%p pc=0x%lx(RVA 0x%x) lr=0x%lx(RVA 0x%x) sp=0x%lx fp=0x%lx
+",
+                     sig, info ? info->si_addr : 0, (unsigned long)pc, NpRVAByPtrFwd(pc),
+                     (unsigned long)lr, NpRVAByPtrFwd(lr), (unsigned long)sp, (unsigned long)fp);
+    NpWriteCrashFd(buf, (size_t)MAX(n, 0));
+
+    void *bt[80];
+    int nb = backtrace(bt, 80);
+    for (int i = 0; i < nb; i++) {
+        n = snprintf(buf, sizeof(buf), "  #%-2d 0x%lx  RVA 0x%x
+", i,
+                     (unsigned long)(uintptr_t)bt[i], NpRVAByPtrFwd((uintptr_t)bt[i]));
+        NpWriteCrashFd(buf, (size_t)MAX(n, 0));
+    }
+    if (gCrashFD >= 0) fsync(gCrashFD);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static uint32_t NpRVAByPtrFwd(uintptr_t p) { return NpRVAByPtr(p); }
 
 static void NpDumpPointers(const char *tag)
 {
@@ -1208,6 +1315,7 @@ static void *NpStatThread(void *arg)
         ticks++;
 
         NpPollNuCCSys();
+        if ((ticks % 5) == 0) NpSessionTick(ticks);
 
         // 首帧后的几何快照（主线程执行，避免 UIKit 线程问题）
         if (!geomLogged && ticks >= 2) {
@@ -1296,6 +1404,8 @@ static void NpInstall(void)
     NpLogOpen();
     NpConfigLoad();
     if (gCfg.captureStderr) NpRedirectStderr();
+    NpSessionBegin();
+    NpCrashInit();
 
     NPLOG(@"══════════════════════════════════════════════");
     NPLOG(@"NarutoPlus v%@ — 帧率解锁 / 分辨率 / Direct 直写", NP_VERSION);
