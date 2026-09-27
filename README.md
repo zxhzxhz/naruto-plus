@@ -110,9 +110,12 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
   "frameRate": 120,       // 0=不改 / 30 / 60 / 120
   "pacerHz": 0,           // VSync 节拍 Hz，0 = 自动（= max(frameRate,60)）
   "logicFps": 0,          // 0 = 与 frameRate 相同；填 30 = 每 4 拍才唤醒一次帧（帧率也随之降到 30）
-  "engineFps": 0,         // 直写引擎 fps 字节（逻辑固定步进 3000/fps）；0 = 自动 = min(frameRate,60)
-                          //   ⚠️ 写 >60 会在进 3D 场景时闪退（60/120=0 落到 nuccSys+0x4B8，
-                          //      且引擎自带校验器就是 fps>60||60%fps → 60），本补丁已强制钳到 60
+  "engineFps": 0,         // 直写引擎 fps 字节；0 = 不碰（保持游戏原值 30，最安全）
+                          //   ⚠️ 写 >60 会在进 3D 场景时闪退（引擎自带校验 fps>60||60%fps → 60，
+                          //      且 60/120=0 会落进 nuccSys+0x4B8）
+  "timeBase": 0,          // 直写全引擎时间基 dword_100D59FC8（默认 3000 单位/秒）
+                          //   ★ 步进 = 时间基 ÷ fps字节 ⇒ 120fps 想回 1.0× 试 750
+                          //     （60fps 试 1500；填 0 = 不碰）
 
   // ★ 开关②：分辨率
   "resolution": "native", // "native" | "1.0"/"0.75"/"0.5"(按屏幕像素比例) | "1920x1080"(固定)
@@ -139,7 +142,8 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
 | 先求稳，只跑到 60 | `frameRate:60, resolution:"native"` |
 | 掉帧时降负载 | `frameRate:120, resolution:"0.75"` |
 | 强制固定 1080p | `resolution:"1920x1080"` |
-| 120fps + 时间流速正确（推荐） | `frameRate:120, engineFps:0`（自动写 120 → 步进 1/120） |
+| 120fps + 时间流速正确（v1.5 推荐先测这条） | `frameRate:120, engineFps:0, timeBase:750` |
+| 120fps 但接受 4× 快进 | `frameRate:120, engineFps:0, timeBase:0` |
 | 只跑 60fps（画面与逻辑都 1×） | `frameRate:60, engineFps:0` |
 | 逻辑要按原样 30Hz（帧率也会掉到 30） | `frameRate:120, logicFps:30` |
 
@@ -207,6 +211,7 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | 版本 | 内容 |
 |---|---|
 | v1.0 | 首版：VSync 节拍补丁 + Init 分频器改写 + swapchain 分辨率/直写属性 hook + 图层统计；配置双开关 + 热重载 |
+| **v1.5** | 找到真正的时间基杠杆：步进公式里的 `3000` 不是立即数，而是全局 `dword_100D59FC8`（`ADRL; LDR W8,[X8]; LDRB W9,[nuccSys+0x992]; UDIV`，被 60+ 处代码引用）。新增 `timeBase` 配置直写该全局（`__TEXT,__const` 走 vm_protect），可在 **fps 字节保持游戏原值 30、绝不触发 >60 闪退** 的前提下把步进改成 1/120；`engineFps` 语义改为「0 = 不碰」；日志同时打印两条模型的流速预测（A：引擎另有固定 3000 实时基准 → 改时间基有效；B：全局即单位基准 → 改时间基无效） |
 | **v1.4** | 新增 `nuccSys::UpdateRenderExtent` hook（守卫 `60/fps=0` 的落地）+ `allowEngineFpsOver60` 危险档：默认仍钳 60；开启后允许把 fps 字节写成 120（配合 UpdateRenderExtent 守卫做「120fps + 步进 1/120 = 时间流速 1.0×」的验证）。同时给 `NpEnforceEngineState` 加了空状态早退 |
 | **v1.3** | **止血 + 模型自证**：1) 设备实测「进 3D 场景闪退」的根因是 fps 字节>60 ⇒ `engineFps` 硬钳到 ≤60（引擎自带校验 `fps>60 \|\| 60%fps → 60`，且 60/fps 会算成 0 落进 `nuccSys+0x4B8`），渲染帧率不受影响，仍是「节拍×分频器」；2) `[STAT]` 新增 `时间流速预测 = 实测fps ÷ 引擎字节`，用于一次性判定步进模型（自然模型预测 2x / 备选模型预测 1x） |
 | **v1.2** | **解耦「渲染帧率」与「逻辑步进」**：定位到引擎内部时间基 = 3000 单位/秒，逻辑固定步进 = `3000 / nuccSys[+0x992]`（`sub_1004D4838` / `sub_1004F836C` / `sub_10051F96C` / `sub_1005205C8` 四处实锤）。120fps 下若步进仍为 1/30 会 4× 加速 ⇒ 新增 `engineFps`（默认自动 = frameRate）直写 fps 字节=120 → 步进 25/3000 秒 = 1/120，时间流速回归 1.0×；并把「分频器 + fps 字节」的纠正收敛到 `NpEnforceEngineState()`，在 `SetFrameRate` hook 之后、`Init` 之后、每秒轮询三个时机强制执行（游戏自己调 `SetFrameRate(30)` 会被立刻纠回） |
