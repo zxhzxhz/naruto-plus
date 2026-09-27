@@ -94,7 +94,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.10"
+#define NP_VERSION              @"1.11"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_CRASH_FILENAME       @"NarutoPlus.crash.log"   // 崩溃黑匣子（小文件，便于拉取）
@@ -120,6 +120,10 @@
 #define TIME_BASE_DEFAULT       3000u
 #define NP_IMAGE_MAX_RVA        0x12B8000u  // narutoNext1 文件大小（用于指针→RVA 映射）
 #define RVA_VSYNC_CB            0x4EA888u   // nuccSys per-vsync 回调（游戏主时钟）
+#define RVA_UPDATE_MAIN         0x4EB39Cu   // 每帧「更新」主体（消费主时钟/VSync 计数器）★ 节流目标
+#define RVA_UPDATE_AUXA         0x4DFDFCu   // 每帧更新阶段 A（全局函数）
+#define RVA_UPDATE_AUXB         0x4E6A54u   // 每帧更新阶段 B（thunk → sub_1004EC444(this+0xB90)）
+#define RVA_DRAW_MAIN           0x4EAC8Cu   // 每帧「绘制」（尾调用）—— 绝不节流
 #define RVA_VSYNC_CLK_SITE1     0x4EA8B8u   // MOVZ/MOVK/UMULL/LSR = (时间基/60) → 主时钟每拍增量
 #define RVA_VSYNC_CLK_SITE2     0x4EA8D8u
 
@@ -299,6 +303,7 @@ static uint8_t  NpEngineFpsByte(void);
 static uint32_t NpTimeBaseLive(void);
 static void     NpApplyVsyncClock(void);
 static void     NpApplyStepBase(void);
+static void     NpApplyLatch(void);
 
 #pragma mark - ============================ 配置 ============================
 
@@ -322,7 +327,9 @@ typedef struct {
     BOOL        dumpPointers;       // 诊断：把引擎关键函数指针映射成 RVA 打进日志（默认开，只读）
     BOOL        clockCompensate;    // 主时钟补偿（默认开）
     int         vsyncCbHz;          // per-vsync 回调目标频率；0 = 自动 60Hz（引擎原始设计节拍）
-    int         stepBase;           // ★ 只改「步进计算点」的常量（0 = 不动，120fps 用 750，60fps 用 1500）
+    int         stepBase;           // 只改「步进计算点」的常量（0 = 不动；与 latch 同时启用时应为 0）
+    int         latchDivisor;       // ★ 逻辑节流：每 N 帧执行一次更新（0 = 自动 = 帧率÷30）
+    int         latchMask;          // 节流目标位掩码：1=更新主体 2=辅助A 4=辅助B（默认 1）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -364,7 +371,9 @@ static id NpCfgDefaultJSON(void)
         @"dumpPointers": @YES,                // 诊断：打印引擎函数指针 RVA（只读，用于定位帧管线）
         @"clockCompensate": @YES,             // 主时钟补偿
         @"vsyncCbHz": @0,                     // per-vsync 回调频率；0=自动 60Hz（原始设计节拍）
-        @"stepBase": @0,                      // 步进基线：只补丁 6 处步进点（120fps→750；0=不动）
+        @"stepBase": @0,                      // 步进基线（0=不动；启用 latch 时保持 0）
+        @"latchDivisor": @0,                  // 逻辑节流：0=自动(帧率÷30)，120fps→4
+        @"latchMask": @1,                     // 节流目标：1=更新主体(默认) 3=+辅助A 7=+辅助B
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -508,6 +517,8 @@ static void NpConfigLoad(void)
     if (j[@"clockCompensate"])    gCfg.clockCompensate    = [j[@"clockCompensate"] boolValue];
     if (j[@"vsyncCbHz"])          gCfg.vsyncCbHz          = [j[@"vsyncCbHz"] intValue];
     if (j[@"stepBase"])           gCfg.stepBase           = [j[@"stepBase"] intValue];
+    if (j[@"latchDivisor"])       gCfg.latchDivisor       = [j[@"latchDivisor"] intValue];
+    if (j[@"latchMask"])          gCfg.latchMask          = [j[@"latchMask"] intValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -780,6 +791,7 @@ static void NpEnforceEngineState(const char *why)
 
     NpApplyVsyncClock();
     NpApplyStepBase();
+    NpApplyLatch();
 
     uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
     if (rend > 0x100000000ULL && gCfg.effDivisor > 0) {
@@ -861,6 +873,83 @@ static BOOL NpApplyPacerPeriod(int pacerHz)
           ok ? @"✅" : @"⚠️", oldPeriod, period, pacerHz, cur0, cur1, cur2, a0, a1, a2);
     if (ok) NPLOG(@"   ↳ MOVZ W24,#%u  MOVZ W25,#%u  MOVN X26,#%u(=-%u)", period - 1, period, period - 1, period);
     return ok;
+}
+
+#pragma mark - ============================ 逻辑节流（★ 120fps 不加速的关键） ============================
+//
+// 设备实测：即使把「动画步进(stepBase=750)」与「主时钟(50 单位×60Hz)」都压到 1.00×，
+// 游戏仍然飞快 —— 说明游戏速度由**帧数**驱动（每帧固定一步，按 30Hz 设计）。
+//
+// 每帧执行体 sub_1004EB6C4 的结构（IDA 实证）：
+//     sub_1004EB39C(this)   ← 更新主体（消费主时钟 +0x98C / VSync 计数器 +0x990）
+//     sub_1004DFDFC()       ← 更新阶段 A
+//     sub_1004E6A54(this)   ← 更新阶段 B
+//     B sub_1004EAC8C       ← 绘制（尾调用）
+//
+// 因此：**只节流三只「更新」函数，绘制照常每帧执行** ⇒ 120fps 呈现 + 30Hz 逻辑 = 1.00×。
+// 主时钟每拍累加(50)，被每次(节流后的)更新读取清零 ⇒ 每次更新拿到 ~100 单位 = 1/30 秒 ✓
+//
+static volatile uint32_t gLatchDiv   = 1;
+static volatile uint32_t gLatchMask  = 1;
+static volatile uint32_t gLatchFrame = 0;
+static volatile BOOL     gLatchRun   = YES;
+static volatile uint64_t gLatchRuns  = 0;
+static volatile uint64_t gLatchSkips = 0;
+
+typedef int64_t (*NpUpdateMainFn)(uintptr_t self);
+typedef int64_t (*NpUpdateAuxAFn)(void);
+typedef int64_t (*NpUpdateAuxBFn)(uintptr_t self);
+static NpUpdateMainFn gOrigUpdateMain = NULL;
+static NpUpdateAuxAFn gOrigUpdateAuxA = NULL;
+static NpUpdateAuxBFn gOrigUpdateAuxB = NULL;
+
+static int64_t NpHook_UpdateMain(uintptr_t self)
+{
+    uint32_t d = gLatchDiv ? gLatchDiv : 1;
+    gLatchRun = (d <= 1) ? YES : ((++gLatchFrame % d) == 0);
+    if (gLatchRun) { gLatchRuns++; return gOrigUpdateMain(self); }
+    gLatchSkips++;
+    return 0;
+}
+
+static int64_t NpHook_UpdateAuxA(void)
+{
+    if (!gLatchRun && (gLatchMask & 2)) return 0;
+    return gOrigUpdateAuxA();
+}
+
+static int64_t NpHook_UpdateAuxB(uintptr_t self)
+{
+    if (!gLatchRun && (gLatchMask & 4)) return 0;
+    return gOrigUpdateAuxB(self);
+}
+
+static void NpApplyLatch(void)
+{
+    if (!gBase || !gCfg.enabled || gCfg.probe) return;
+
+    uint32_t d = (gCfg.latchDivisor > 0) ? (uint32_t)gCfg.latchDivisor : 0;
+    if (d == 0) {
+        uint32_t wake = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
+                        ? (uint32_t)gCfg.effPacerHz / (uint32_t)gCfg.effDivisor : 30;
+        d = (wake + 29) / 30;                       // 目标 30Hz 逻辑
+    }
+    if (d < 1) d = 1;
+    if (d > 240) d = 240;
+    uint32_t mask = (gCfg.latchMask > 0) ? (uint32_t)gCfg.latchMask : 0;
+
+    if (d != gLatchDiv || mask != gLatchMask) {
+        gLatchDiv = d;
+        gLatchMask = mask;
+        gLatchFrame = 0;
+        if (d > 1)
+            NPLOG(@"[LATCH] 逻辑节流: 每 %u 帧执行 1 次更新（%d 帧/秒 → %d 次/秒逻辑），mask=%u；绘制仍每帧（120fps 呈现不受影响）",
+                  d, gCfg.effPacerHz, gCfg.effPacerHz / (int)d, mask);
+        else
+            NPLOG(@"[LATCH] 逻辑节流已关闭（d=1，更新每帧执行）");
+    }
+    if (d > 1 && gCfg.stepBase > 0)
+        NPLOG(@"⚠️ 节流生效时建议 stepBase=0：动画步进由节流后的更新驱动，叠加 stepBase 会偏慢");
 }
 
 #pragma mark - ============================ 步进基线按点补丁（★ 关键：不动全局时间基） ============================
@@ -1365,10 +1454,12 @@ static void *NpStatThread(void *arg)
         NPLOG(@"[STAT] 时间流速预测 %.2fx (= 实测 %.1f fps ÷ 引擎字节 %u)   ← 与手感对照；不符请回传本行",
               predFlow, fps, eb);
         NPLOG(@"[STAT] 实测 %.1f fps (%llu 帧 / %.1fs) · drawableSize=%dx%d · layer(opaque=%d fbOnly=%d vsync=%d contentsScale=%.1f) · "
-              @"分频器=%d 节拍=%dHz · 时间基=%u 引擎fps字节=%u(步进 %u 单位) · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
+              @"分频器=%d 节拍=%dHz · 节流=1/%u(mask=%u 跑%llu/跳%llu) · 时间基=%u 引擎fps字节=%u(步进 %u 单位) · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
               fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,
               gLayerOpaque, gLayerFramebufferOnly, gLayerDisplaySync, gLayerContentsScale,
               gCfg.effDivisor, gCfg.effPacerHz,
+              gLatchDiv, gLatchMask,
+              (unsigned long long)gLatchRuns, (unsigned long long)gLatchSkips,
               NpTimeBaseLive(),
               NpEngineFpsByte(),
               (NpEngineFpsByte() ? NpTimeBaseLive() / NpEngineFpsByte() : 0),
@@ -1468,6 +1559,27 @@ static void NpInstall(void)
             NPLOG(@"%@ hook nuccSys::UpdateRenderExtent (守卫 60/fps)", gOrigUpdateRenderExtent ? @"✅" : @"❌");
         } else {
             NPLOG(@"⚠️ UpdateRenderExtent 指纹不匹配 → 跳过守卫");
+        }
+
+        // 每帧「更新阶段」三只函数 —— 逻辑节流目标（绘制 sub_1004EAC8C 不动）
+        static const uint8_t fpUpMain[16] = {0xe9,0x23,0xbd,0x6d,0xf4,0x4f,0x01,0xa9,
+                                             0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91};
+        static const uint8_t fpUpAuxA[16] = {0xff,0xc3,0x05,0xd1,0xfc,0x6f,0x15,0xa9,
+                                             0xfd,0x7b,0x16,0xa9,0xfd,0x83,0x05,0x91};
+        static const uint8_t fpUpAuxB[8]  = {0x00,0x40,0x2e,0x91,0x7b,0x16,0x00,0x14};
+        if (np_mem_eq(np_at(RVA_UPDATE_MAIN), fpUpMain, sizeof(fpUpMain))) {
+            pMSHookFunction(np_at(RVA_UPDATE_MAIN), (void *)NpHook_UpdateMain, (void **)&gOrigUpdateMain);
+            NPLOG(@"%@ hook 每帧更新主体 (0x4EB39C) —— 逻辑节流主开关", gOrigUpdateMain ? @"✅" : @"❌");
+        } else {
+            NPLOG(@"⚠️ 更新主体指纹不匹配 → 跳过节流");
+        }
+        if (np_mem_eq(np_at(RVA_UPDATE_AUXA), fpUpAuxA, sizeof(fpUpAuxA))) {
+            pMSHookFunction(np_at(RVA_UPDATE_AUXA), (void *)NpHook_UpdateAuxA, (void **)&gOrigUpdateAuxA);
+            NPLOG(@"%@ hook 更新阶段A (0x4DFDFC)", gOrigUpdateAuxA ? @"✅" : @"❌");
+        }
+        if (np_mem_eq(np_at(RVA_UPDATE_AUXB), fpUpAuxB, sizeof(fpUpAuxB))) {
+            pMSHookFunction(np_at(RVA_UPDATE_AUXB), (void *)NpHook_UpdateAuxB, (void **)&gOrigUpdateAuxB);
+            NPLOG(@"%@ hook 更新阶段B (0x4E6A54)", gOrigUpdateAuxB ? @"✅" : @"❌");
         }
 
         // per-vsync 回调（主时钟 / VSync 计数器）—— 节流回 60Hz
