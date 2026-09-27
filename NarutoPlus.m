@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.2"
+#define NP_VERSION              @"1.3"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -337,11 +337,17 @@ static void NpComputePlan(void)
     gCfg.effPacerHz = pacer;
     gCfg.effDivisor = div;
 
-    // 引擎 fps 字节 = 逻辑固定步进 3000/fps。要让 120fps 下时间流速仍为 1.0×，
-    // 必须让步进与实际帧率一致 ⇒ 直写 +0x992 = frameRate（120fps → 25 单位/帧 = 1/120 秒）
+    // 引擎 fps 字节 = 逻辑固定步进 3000/fps。
+    // ⚠️ 上限死死卡在 60：引擎自带校验就是 `fps>60 || 60%fps → 60`，
+    //    实测写 120 会在「进入 3D 场景」时闪退（60/120=0 落到 nuccSys+0x4B8，
+    //    且引擎内部存在以 60 为前提的表/索引）。因此这里永不写 >60 的值。
     int ef = (gCfg.engineFps > 0) ? gCfg.engineFps : gCfg.frameRate;
-    if (ef < 1)   ef = 1;
-    if (ef > 255) ef = 255;
+    if (ef < 1)  ef = 1;
+    if (ef > 60) {
+        NPLOG(@"⚠️ engineFps(%d) 超过引擎上限 60 → 自动钳到 60（写 >60 会在进 3D 场景时闪退）；"
+              @"渲染帧率仍由 VSync 节拍×分频器决定，不受此钳制影响", ef);
+        ef = 60;
+    }
     gCfg.effEngineFps = ef;
 }
 
@@ -929,6 +935,10 @@ static void *NpStatThread(void *arg)
         frames = now; lastStat = t;
         (void)lastT;
 
+        uint8_t eb = NpEngineFpsByte();
+        double predFlow = (eb > 0) ? (fps / (double)eb) : 0.0;
+        NPLOG(@"[STAT] 时间流速预测 %.2fx (= 实测 %.1f fps ÷ 引擎字节 %u)   ← 与手感对照；不符请回传本行",
+              predFlow, fps, eb);
         NPLOG(@"[STAT] 实测 %.1f fps (%llu 帧 / %.1fs) · drawableSize=%dx%d · layer(opaque=%d fbOnly=%d vsync=%d contentsScale=%.1f) · "
               @"分频器=%d 节拍=%dHz · 引擎fps字节=%u(步进 %u/3000s) · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
               fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,

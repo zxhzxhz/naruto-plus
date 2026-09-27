@@ -110,8 +110,9 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
   "frameRate": 120,       // 0=不改 / 30 / 60 / 120
   "pacerHz": 0,           // VSync 节拍 Hz，0 = 自动（= max(frameRate,60)）
   "logicFps": 0,          // 0 = 与 frameRate 相同；填 30 = 每 4 拍才唤醒一次帧（帧率也随之降到 30）
-  "engineFps": 0,         // 直写引擎 fps 字节（逻辑固定步进 3000/fps）；0 = 自动跟 frameRate
-                          //   ★ 120fps 时必须是 120，否则逻辑步进仍是 1/30 → 游戏 4 倍速
+  "engineFps": 0,         // 直写引擎 fps 字节（逻辑固定步进 3000/fps）；0 = 自动 = min(frameRate,60)
+                          //   ⚠️ 写 >60 会在进 3D 场景时闪退（60/120=0 落到 nuccSys+0x4B8，
+                          //      且引擎自带校验器就是 fps>60||60%fps → 60），本补丁已强制钳到 60
 
   // ★ 开关②：分辨率
   "resolution": "native", // "native" | "1.0"/"0.75"/"0.5"(按屏幕像素比例) | "1920x1080"(固定)
@@ -204,5 +205,6 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | 版本 | 内容 |
 |---|---|
 | v1.0 | 首版：VSync 节拍补丁 + Init 分频器改写 + swapchain 分辨率/直写属性 hook + 图层统计；配置双开关 + 热重载 |
+| **v1.3** | **止血 + 模型自证**：1) 设备实测「进 3D 场景闪退」的根因是 fps 字节>60 ⇒ `engineFps` 硬钳到 ≤60（引擎自带校验 `fps>60 \|\| 60%fps → 60`，且 60/fps 会算成 0 落进 `nuccSys+0x4B8`），渲染帧率不受影响，仍是「节拍×分频器」；2) `[STAT]` 新增 `时间流速预测 = 实测fps ÷ 引擎字节`，用于一次性判定步进模型（自然模型预测 2x / 备选模型预测 1x） |
 | **v1.2** | **解耦「渲染帧率」与「逻辑步进」**：定位到引擎内部时间基 = 3000 单位/秒，逻辑固定步进 = `3000 / nuccSys[+0x992]`（`sub_1004D4838` / `sub_1004F836C` / `sub_10051F96C` / `sub_1005205C8` 四处实锤）。120fps 下若步进仍为 1/30 会 4× 加速 ⇒ 新增 `engineFps`（默认自动 = frameRate）直写 fps 字节=120 → 步进 25/3000 秒 = 1/120，时间流速回归 1.0×；并把「分频器 + fps 字节」的纠正收敛到 `NpEnforceEngineState()`，在 `SetFrameRate` hook 之后、`Init` 之后、每秒轮询三个时机强制执行（游戏自己调 `SetFrameRate(30)` 会被立刻纠回） |
 | **v1.1** | 修 `%s` 传 NSString 导致日志乱码；配置改为非原子写+回读校验、无效配置自动备份 `.bad` 并重写；**分辨率改为以「引擎请求的 extent」为原生基准**（不再依赖 UIScreen，constructor 阶段即可正确决策）；`forceDirect` 判定同样去 UIKit 依赖（修复设备实测 direct 未生效）；新增 `[GEO]` 图层/屏幕几何快照、`directUsage` / `forceContentsScale` 实验开关；STAT 行补充 Init/SetFrameRate 调用计数与 swapchain 原始→覆写尺寸 |
