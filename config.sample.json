@@ -9,6 +9,7 @@
   "forceDirect": true,
   "directUsage": false,
   "forceContentsScale": false,
+  "allowEngineFpsOver60": false,
   "noVsync": false,
   "captureStderr": true,
   "statSeconds": 5

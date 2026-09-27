@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.3"
+#define NP_VERSION              @"1.4"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -102,6 +102,7 @@
 #define RVA_PACER_MOV_W25       0x4C6790u   // MOV  W25, #0x411A
 #define RVA_PACER_MOVN_X26      0x4C6794u   // MOVN X26, #0x4119 (=-16666)
 #define RVA_SET_FRAMERATE       0x4EA348u   // nuccSys::SetFrameRate
+#define RVA_UPDATE_RENDER       0x4E9AE0u   // nuccSys::UpdateRenderExtent（写 +0x4B8/+0x1196/1198）
 #define RVA_UPDATE_RENDER_EXT   0x4E9AE0u   // nuccSys::UpdateRenderExtent（文档用）
 #define RVA_VK_CREATE_SWAPCHAIN 0x5D1504u   // vkCreateSwapchainKHR
 #define RVA_MVK_SWAPCHAIN_INIT  0x65ED70u   // MVKSwapchain::init（文档用）
@@ -240,6 +241,7 @@ typedef struct {
     BOOL        forceDirect;        // 原生分辨率时把 swapchain/图层改成直写友好
     BOOL        directUsage;        // 激进档：去掉 TRANSFER_SRC/DST → framebufferOnly=YES
     BOOL        forceContentsScale; // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
+    BOOL        allowOver60;        // 危险档：允许把引擎 fps 字节写到 >60（默认禁止，进 3D 场景会闪退）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -276,6 +278,7 @@ static id NpCfgDefaultJSON(void)
         @"forceDirect"       : @YES,
         @"directUsage"       : @NO,
         @"forceContentsScale": @NO,
+        @"allowEngineFpsOver60": @NO,         // true = 允许 engineFps>60（引擎未支持，风险自负）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -343,10 +346,13 @@ static void NpComputePlan(void)
     //    且引擎内部存在以 60 为前提的表/索引）。因此这里永不写 >60 的值。
     int ef = (gCfg.engineFps > 0) ? gCfg.engineFps : gCfg.frameRate;
     if (ef < 1)  ef = 1;
-    if (ef > 60) {
+    if (ef > 60 && !gCfg.allowOver60) {
         NPLOG(@"⚠️ engineFps(%d) 超过引擎上限 60 → 自动钳到 60（写 >60 会在进 3D 场景时闪退）；"
               @"渲染帧率仍由 VSync 节拍×分频器决定，不受此钳制影响", ef);
         ef = 60;
+    } else if (ef > 60) {
+        NPLOG(@"⚠️⚠️ 已开启 allowEngineFpsOver60：引擎 fps 字节将写为 %d（引擎自身校验上限是 60）。"
+              @"本补丁已加 nuccSys::UpdateRenderExtent 守卫把 60/fps=0 立即纠回，但若仍闪退请改回 false", ef);
     }
     gCfg.effEngineFps = ef;
 }
@@ -411,6 +417,7 @@ static void NpConfigLoad(void)
     if (j[@"forceDirect"])        gCfg.forceDirect        = [j[@"forceDirect"] boolValue];
     if (j[@"directUsage"])        gCfg.directUsage        = [j[@"directUsage"] boolValue];
     if (j[@"forceContentsScale"]) gCfg.forceContentsScale = [j[@"forceContentsScale"] boolValue];
+    if (j[@"allowEngineFpsOver60"]) gCfg.allowOver60      = [j[@"allowEngineFpsOver60"] boolValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -610,6 +617,19 @@ static void NpEnforceEngineState(const char *why)
 
 // 兼容旧调用点
 static void NpPollNuCCSys(void) { NpEnforceEngineState("轮询"); }
+
+// ── nuccSys::UpdateRenderExtent 守卫 ──
+// 该函数会重算 +0x4B8 = 60/fps。fps 字节 >60 时这里算出 0，引擎在 3D 场景初始化路径上
+// 读到 0 会直接崩（设备实测：写 120 → 进 3D 场景闪退）。因此每次它跑完立刻纠回。
+typedef int64_t (*UpdateRenderExtentFn)(uintptr_t self, void *presetEntry);
+static UpdateRenderExtentFn gOrigUpdateRenderExtent = NULL;
+
+static int64_t NpHook_UpdateRenderExtent(uintptr_t self, void *presetEntry)
+{
+    int64_t r = gOrigUpdateRenderExtent(self, presetEntry);
+    NpEnforceEngineState("UpdateRenderExtent后");
+    return r;
+}
 
 // 读当前引擎 fps 字节（仅用于日志）
 static uint8_t NpEngineFpsByte(void)
@@ -1029,6 +1049,16 @@ static void NpInstall(void)
         if (np_mem_eq(np_at(RVA_SET_FRAMERATE), fpSetFps, sizeof(fpSetFps))) {
             pMSHookFunction(np_at(RVA_SET_FRAMERATE), (void *)NpHook_SetFrameRate, (void **)&gOrigSetFrameRate);
             NPLOG(@"%@ hook nuccSys::SetFrameRate (仅记录)", gOrigSetFrameRate ? @"✅" : @"❌");
+        }
+
+        // 3-2. nuccSys::UpdateRenderExtent — 纠回 60/fps 造成的 0
+        static const uint8_t fpUpdRe[16] = {0xe9,0x23,0xbc,0x6d,0xf6,0x57,0x01,0xa9,
+                                            0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9};
+        if (np_mem_eq(np_at(RVA_UPDATE_RENDER), fpUpdRe, sizeof(fpUpdRe))) {
+            pMSHookFunction(np_at(RVA_UPDATE_RENDER), (void *)NpHook_UpdateRenderExtent, (void **)&gOrigUpdateRenderExtent);
+            NPLOG(@"%@ hook nuccSys::UpdateRenderExtent (守卫 60/fps)", gOrigUpdateRenderExtent ? @"✅" : @"❌");
+        } else {
+            NPLOG(@"⚠️ UpdateRenderExtent 指纹不匹配 → 跳过守卫");
         }
 
         if (np_mem_eq(np_at(RVA_VK_CREATE_SWAPCHAIN), fpVkSw, sizeof(fpVkSw))) {
