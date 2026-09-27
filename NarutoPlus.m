@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.5.1"
+#define NP_VERSION              @"1.6"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -110,6 +110,7 @@
 #define RVA_NUMMRENDER_INSTANCE 0xF7F328u   // mmSingleton<nummRender,...>::s_Instance
 #define RVA_TIME_BASE_GLOBAL    0xD59FC8u   // dword_100D59FC8 = 3000（全引擎时间基，__TEXT,__const）
 #define TIME_BASE_DEFAULT       3000u
+#define NP_IMAGE_MAX_RVA        0x12B8000u  // narutoNext1 文件大小（用于指针→RVA 映射）
 
 // nuccSys 字段
 #define OFF_NUCC_RENDER_W       1196u       // +0x4AC
@@ -250,6 +251,7 @@ typedef struct {
     BOOL        directUsage;        // 激进档：去掉 TRANSFER_SRC/DST → framebufferOnly=YES
     BOOL        forceContentsScale; // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
     BOOL        allowOver60;        // 危险档：允许把引擎 fps 字节写到 >60（默认禁止，进 3D 场景会闪退）
+    BOOL        dumpPointers;       // 诊断：把引擎关键函数指针映射成 RVA 打进日志（默认开，只读）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -288,6 +290,7 @@ static id NpCfgDefaultJSON(void)
         @"directUsage"       : @NO,
         @"forceContentsScale": @NO,
         @"allowEngineFpsOver60": @NO,         // true = 允许 engineFps>60（引擎未支持，风险自负）
+        @"dumpPointers": @YES,                // 诊断：打印引擎函数指针 RVA（只读，用于定位帧管线）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -427,6 +430,7 @@ static void NpConfigLoad(void)
     if (j[@"directUsage"])        gCfg.directUsage        = [j[@"directUsage"] boolValue];
     if (j[@"forceContentsScale"]) gCfg.forceContentsScale = [j[@"forceContentsScale"] boolValue];
     if (j[@"allowEngineFpsOver60"]) gCfg.allowOver60      = [j[@"allowEngineFpsOver60"] boolValue];
+    if (j[@"dumpPointers"])       gCfg.dumpPointers       = [j[@"dumpPointers"] boolValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -517,6 +521,46 @@ static BOOL NpResolveHookEngine(void)
     if (!pMSHookFunction) pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "A3HookFunction");
     NPLOG(@"Hook 引擎: MSHookFunction=%p", (void *)pMSHookFunction);
     return pMSHookFunction != NULL;
+}
+
+#pragma mark - ============================ 引擎指针 → RVA 映射（帧管线定位工装） ============================
+
+static uint32_t NpRVAByPtr(uintptr_t p)
+{
+    if (!gBase || p < gBase) return 0;
+    uint64_t off = (uint64_t)(p - gBase);
+    if (off == 0 || off >= NP_IMAGE_MAX_RVA) return 0;
+    return (uint32_t)off;
+}
+
+static void NpDumpPointers(const char *tag)
+{
+    if (!gBase || !gCfg.dumpPointers) return;
+    uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
+    if (rend < 0x100000000ULL) return;                 // 引擎尚未初始化
+
+    static const char *names[] = {"vtable", "vsync回调fn", "vsync回调ctx", "分频器",
+                                  "FrameStart线程对象", "WaitPrevDraw线程对象", "绘制命令管理器"};
+    static const uint32_t offs[] = {0x00, 0x38, 0x40, 0x9C, 0x108, 0x168, 0x1C8};
+
+    NPLOG(@"[DUMP/%@] nummRender @0x%lx  (RVA 0x%x)", [NSString stringWithUTF8String:tag],
+          (unsigned long)rend, NpRVAByPtr(rend));
+    for (int i = 0; i < 7; i++) {
+        uintptr_t v = *(volatile uintptr_t *)(rend + offs[i]);
+        NPLOG(@"[DUMP/%@]   +0x%03X %@ = 0x%lx%s", [NSString stringWithUTF8String:tag], offs[i],
+              [NSString stringWithUTF8String:names[i]], (unsigned long)v,
+              (NpRVAByPtr(v) ? [[NSString stringWithFormat:@"  → RVA 0x%x", NpRVAByPtr(v)] UTF8String] : ""));
+    }
+    for (int k = 4; k <= 6; k++) {
+        uintptr_t o = *(volatile uintptr_t *)(rend + offs[k]);
+        if (!NpRVAByPtr(o)) continue;
+        for (int j = 0; j < 0x50; j += 8) {
+            uintptr_t v = *(volatile uintptr_t *)(o + j);
+            uint32_t r = NpRVAByPtr(v);
+            if (r) NPLOG(@"[DUMP/%@]   obj(0x%03X)+0x%02X = 0x%lx → RVA 0x%x",
+                         [NSString stringWithUTF8String:tag], offs[k], j, (unsigned long)v, r);
+        }
+    }
 }
 
 #pragma mark - ============================ 帧率 ============================
@@ -976,6 +1020,8 @@ static void *NpStatThread(void *arg)
                 } @catch (NSException *e) { (void)e; }
             });
         }
+
+        if (ticks == 3 || ticks == 12) NpDumpPointers(ticks == 3 ? "3s" : "12s");
 
         if (gInitThunkCalls == 0 && gSwapchainCount > 0 && ticks == 5)
             NPLOG(@"ℹ️ 已创建 %d 个 swapchain，但 nummRender::Init(0x4C3BA0) 一次都没被调用 → 分频器改由轮询直写 nummRender+0x9C",
