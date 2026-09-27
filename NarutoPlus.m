@@ -422,11 +422,20 @@ static void NpConfigLoad(void)
              : (gCfg.resMode == NpResModeScale ? [NSString stringWithFormat:@"scale %.3f", gCfg.resScale]
                                                : [NSString stringWithFormat:@"%dx%d", gCfg.resW, gCfg.resH])),
           gCfg.forceDirect, gCfg.directUsage, gCfg.forceContentsScale, gCfg.noVsync, gCfg.pacerHz, gCfg.logicFps);
-    NPLOG(@"引擎 fps 字节将写为 %d → 逻辑固定步进 %u/3000 秒 (%.2f ms/帧)；%u%%%d=%u",
-          gCfg.effEngineFps, NUCC_TIME_BASE_PER_SEC / (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
-          1000.0 / (double)(gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
-          NUCC_TIME_BASE_PER_SEC, (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
-          NUCC_TIME_BASE_PER_SEC % (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1));
+    {
+        int ef = (gCfg.effEngineFps > 0) ? gCfg.effEngineFps : 1;
+        double stepMs = 1000.0 / (double)ef;
+        double ticksPerSec = (gCfg.effPacerHz > 0 && gCfg.effDivisor > 0)
+                             ? (double)gCfg.effPacerHz / (double)gCfg.effDivisor : 0;
+        double flow = (ticksPerSec > 0) ? ticksPerSec * stepMs / 1000.0 : 0;
+        NPLOG(@"逻辑步进: 字节=%d → %u/3000 秒/帧 (%.2f ms/帧) | 唤醒 %.0f 次/秒 | 预计时间流速 %.2fx %@",
+              ef, NUCC_TIME_BASE_PER_SEC / ef, stepMs, ticksPerSec, flow,
+              (flow > 1.05 ? @"← 偏快，把 engineFps 提到与 frameRate 相同即可" :
+               (flow < 0.95 ? @"← 偏慢" : @"← 正常")));
+        if (NUCC_TIME_BASE_PER_SEC % ef)
+            NPLOG(@"⚠️ 3000 %% %d = %u ≠ 0：步进非整数，可能出现节奏抖动（120/60/30/25 均可整除）",
+                  ef, NUCC_TIME_BASE_PER_SEC % ef);
+    }
 }
 
 #pragma mark - ============================ 目标分辨率推导 ============================
@@ -569,11 +578,10 @@ static void NpEnforceEngineState(const char *why)
         if (eff != 0 && gCfg.effEngineFps > 0 && eff != (uint8_t)gCfg.effEngineFps) {
             np_wr8(inst + OFF_NUCC_FPS_EFFECTIVE, (uint8_t)gCfg.effEngineFps);
             np_wr8(inst + OFF_NUCC_FPS_REQUESTED, (uint8_t)gCfg.effEngineFps);
-            NPLOG(@"[STEP] (%@) 引擎 fps 字节 %u → %d  ⇒ 逻辑固定步进 %u/3000 秒/帧 (%.2f ms → %.2f ms，时间流速 %.2fx)",
+            NPLOG(@"[STEP] (%@) 引擎 fps 字节 %u → %d  ⇒ 单帧逻辑步进 3000/fps = %u/3000 秒 (%.2f ms/帧 → %.2f ms/帧)",
                   [NSString stringWithUTF8String:why], eff, gCfg.effEngineFps,
                   NUCC_TIME_BASE_PER_SEC / gCfg.effEngineFps,
-                  1000.0 / (double)eff, 1000.0 / (double)gCfg.effEngineFps,
-                  (double)gCfg.effEngineFps / (double)eff);
+                  1000.0 / (double)eff, 1000.0 / (double)gCfg.effEngineFps);
         }
         if (gCfg.effDivisor > 0) {
             uint32_t div = *(volatile uint32_t *)(inst + OFF_NUCC_FPS_DIVISOR);
