@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.7"
+#define NP_VERSION              @"1.8"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -256,7 +256,8 @@ typedef struct {
     BOOL        forceContentsScale; // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
     BOOL        allowOver60;        // 危险档：允许把引擎 fps 字节写到 >60（默认禁止，进 3D 场景会闪退）
     BOOL        dumpPointers;       // 诊断：把引擎关键函数指针映射成 RVA 打进日志（默认开，只读）
-    BOOL        clockCompensate;    // 主时钟补偿：把 vsync 回调里的 ÷60 补成 ÷(字节×分频器)（默认开）
+    BOOL        clockCompensate;    // 主时钟补偿（默认开）
+    int         vsyncCbHz;          // per-vsync 回调目标频率；0 = 自动 60Hz（引擎原始设计节拍）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -296,7 +297,8 @@ static id NpCfgDefaultJSON(void)
         @"forceContentsScale": @NO,
         @"allowEngineFpsOver60": @NO,         // true = 允许 engineFps>60（引擎未支持，风险自负）
         @"dumpPointers": @YES,                // 诊断：打印引擎函数指针 RVA（只读，用于定位帧管线）
-        @"clockCompensate": @YES,             // 主时钟补偿（保持动画与主时钟同源，见 README 不变量）
+        @"clockCompensate": @YES,             // 主时钟补偿
+        @"vsyncCbHz": @0,                     // per-vsync 回调频率；0=自动 60Hz（原始设计节拍）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -438,6 +440,7 @@ static void NpConfigLoad(void)
     if (j[@"allowEngineFpsOver60"]) gCfg.allowOver60      = [j[@"allowEngineFpsOver60"] boolValue];
     if (j[@"dumpPointers"])       gCfg.dumpPointers       = [j[@"dumpPointers"] boolValue];
     if (j[@"clockCompensate"])    gCfg.clockCompensate    = [j[@"clockCompensate"] boolValue];
+    if (j[@"vsyncCbHz"])          gCfg.vsyncCbHz          = [j[@"vsyncCbHz"] intValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -776,22 +779,70 @@ static BOOL NpPatchClockSite(uint32_t rva, const void *bytes)
     return NO;
 }
 
+// per-vsync 回调 hook：把它节流回原始 60Hz 设计节拍
+//  理由：该回调里的「VSync 计数器 +1」被 sub_1004EB39C 消费（决定子步进），
+//        120Hz 下会变成 2 倍速 → 标题/时序错乱（设备实测）。
+typedef int64_t (*VSyncCbFn)(uintptr_t ctx);
+static VSyncCbFn      gOrigVSyncCb   = NULL;
+static volatile uint32_t gVSyncCbCount = 0;
+static volatile uint32_t gVSyncCbSkip  = 1;      // 每 skip 次调用原函数一次
+
+static int64_t NpHook_VSyncCallback(uintptr_t ctx)
+{
+    uint32_t skip = gVSyncCbSkip ? gVSyncCbSkip : 1;
+    if (skip > 1) {
+        uint32_t c = ++gVSyncCbCount;
+        if ((c % skip) != 0) return 0;          // 本拍丢弃
+    }
+    return gOrigVSyncCb(ctx);
+}
+
+// 期望的「每拍主时钟增量」= 动画速率 ÷ 回调频率
+//   动画速率 = (时间基 ÷ fps字节) × (节拍 ÷ 分频器)   单位/秒
+//   回调频率 = 节拍 ÷ skip
+// 两者同为 3000 单位/秒（原始设计）即时间流速 1.0×
+static uint32_t NpDesiredClockInc(uint32_t *outAnimRate, uint32_t *outCbHz)
+{
+    uint8_t  byte = NpEngineFpsByte();
+    if (byte == 0 || gCfg.effPacerHz <= 0) return 0;
+    uint32_t div  = (gCfg.effDivisor > 0) ? (uint32_t)gCfg.effDivisor : 1u;
+    uint32_t tb   = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase : NpTimeBaseLive();
+    if (tb == 0) return 0;
+    uint32_t step = tb / byte;
+    uint32_t wake = (uint32_t)gCfg.effPacerHz / div;
+    uint32_t anim = step * wake;                            // 单位/秒
+    uint32_t skip = (uint32_t)((gVSyncCbSkip > 0) ? gVSyncCbSkip : 1);
+    uint32_t cb   = (uint32_t)gCfg.effPacerHz / skip;       // 回调频率
+    if (cb == 0) cb = 1;
+    if (outAnimRate) *outAnimRate = anim;
+    if (outCbHz)     *outCbHz = cb;
+    uint32_t inc = anim / cb;
+    return inc ? inc : 1;
+}
+
 static void NpApplyVsyncClock(void)
 {
     if (!gBase || !gCfg.enabled || gCfg.probe || !gCfg.clockCompensate) return;
+    if (NpEngineFpsByte() == 0) return;
 
-    uint8_t  byte = NpEngineFpsByte();
-    if (byte == 0) return;                                  // 引擎尚未初始化
-    uint32_t div  = (gCfg.effDivisor > 0) ? (uint32_t)gCfg.effDivisor : 1u;
-    uint32_t tb   = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase : NpTimeBaseLive();
-    uint32_t d    = (uint32_t)byte * div;
-    if (d == 0 || tb == 0) return;
+    // 1) 设定回调节流比（原始设计 = 60Hz）
+    int targetHz = (gCfg.vsyncCbHz > 0) ? gCfg.vsyncCbHz : 60;
+    uint32_t wantSkip = 1;
+    if (targetHz > 0 && gCfg.effPacerHz > targetHz)
+        wantSkip = (uint32_t)((gCfg.effPacerHz + targetHz - 1) / targetHz);
+    if (wantSkip != gVSyncCbSkip) {
+        gVSyncCbSkip = wantSkip;
+        NPLOG(@"✅ [CLOCK] per-vsync 回调节流: 每 %u 拍执行 1 次（%dHz ÷ %u ≈ %dHz，恢复引擎原始节拍）",
+              wantSkip, gCfg.effPacerHz, wantSkip, gCfg.effPacerHz / (int)wantSkip);
+    }
 
-    uint32_t nativeInc = tb / 60u;                          // 引擎默认行为
-    uint32_t want      = tb / d;                            // 补偿后（d==60 时与 native 相同）
-    if (want == 0) want = 1;
+    // 2) 主时钟每拍增量
+    uint32_t anim = 0, cb = 0;
+    uint32_t want = NpDesiredClockInc(&anim, &cb);
+    if (want == 0) return;
 
-    if (want == nativeInc) {                                // 不变量天然成立 → 还原（若曾补过）
+    uint32_t nativeInc = NpTimeBaseLive() / 60u;
+    if (want == nativeInc) {                       // 已与引擎默认一致 → 还原（若曾补过）
         if (gClockIncApplied == 0) return;
         BOOL ok = YES;
         for (int i = 0; i < 2; i++)
@@ -799,7 +850,7 @@ static void NpApplyVsyncClock(void)
         if (ok) { gClockIncApplied = 0; NPLOG(@"✅ [CLOCK] 主时钟恢复引擎默认（每拍 %u 单位）", nativeInc); }
         return;
     }
-    if (want == gClockIncApplied) return;                   // 已是目标值
+    if (want == gClockIncApplied) return;
 
     if (!gClockOrigSaved) {
         memcpy(gClockOrig, np_at(RVA_VSYNC_CLK_SITE1), 16);
@@ -810,9 +861,13 @@ static void NpApplyVsyncClock(void)
     for (int i = 0; i < 2; i++)
         ok = NpPatchClockSite(i ? RVA_VSYNC_CLK_SITE2 : RVA_VSYNC_CLK_SITE1, patch) && ok;
 
-    NPLOG(@"%@ [CLOCK] 主时钟补偿: 每拍 %u 单位（时间基 %u ÷ (字节 %u × 分频器 %u)；引擎默认是 ÷60=%u）",
-          ok ? @"✅" : @"⚠️", want, tb, byte, div, nativeInc);
-    if (ok) gClockIncApplied = want;
+    NPLOG(@"%@ [CLOCK] 主时钟每拍 %u 单位 × %u 次/秒 = %u 单位/秒（引擎默认每拍 %u）",
+          ok ? @"✅" : @"⚠️", want, cb, want * cb, nativeInc);
+    if (ok) {
+        gClockIncApplied = want;
+        NPLOG(@"时间流速: 动画/逻辑 = %u 单位/秒 → %.2fx ；主时钟 = %u 单位/秒 → %.2fx   (数据/原始基准 3000)",
+              anim, anim / 3000.0, want * cb, (want * cb) / 3000.0);
+    }
 }
 
 #pragma mark - ============================ Vulkan swapchain ============================
@@ -951,22 +1006,22 @@ static void Np_setDrawableSize(id self, SEL _cmd, CGSize sz)
 static void (*orig_setOpaque)(id, SEL, BOOL);
 static void Np_setOpaque(id self, SEL _cmd, BOOL v)
 {
-    gLayerOpaque = v ? 1 : 0;
     if (NpDirectActive() && !v) {
         NPLOG(@"[LAYER] setOpaque:NO → 强制 YES（Direct 直写需要不透明）");
         v = YES;
     }
+    gLayerOpaque = v ? 1 : 0;            // 记录“最终生效值”，避免诊断误判
     orig_setOpaque(self, _cmd, v);
 }
 
 static void (*orig_setFramebufferOnly)(id, SEL, BOOL);
 static void Np_setFramebufferOnly(id self, SEL _cmd, BOOL v)
 {
-    gLayerFramebufferOnly = v ? 1 : 0;
     if (NpDirectActive() && gCfg.directUsage && !v) {
         NPLOG(@"[LAYER] setFramebufferOnly:NO → 强制 YES（directUsage=true）");
         v = YES;
     }
+    gLayerFramebufferOnly = v ? 1 : 0;
     orig_setFramebufferOnly(self, _cmd, v);
 }
 
@@ -1232,6 +1287,16 @@ static void NpInstall(void)
             NPLOG(@"%@ hook nuccSys::UpdateRenderExtent (守卫 60/fps)", gOrigUpdateRenderExtent ? @"✅" : @"❌");
         } else {
             NPLOG(@"⚠️ UpdateRenderExtent 指纹不匹配 → 跳过守卫");
+        }
+
+        // per-vsync 回调（主时钟 / VSync 计数器）—— 节流回 60Hz
+        static const uint8_t fpVsyncCb[16] = {0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9,
+                                              0xfd,0x43,0x00,0x91,0xf3,0x03,0x00,0xaa};
+        if (np_mem_eq(np_at(RVA_VSYNC_CB), fpVsyncCb, sizeof(fpVsyncCb))) {
+            pMSHookFunction(np_at(RVA_VSYNC_CB), (void *)NpHook_VSyncCallback, (void **)&gOrigVSyncCb);
+            NPLOG(@"%@ hook nuccSys per-vsync 回调 (RVA 0x4EA888)", gOrigVSyncCb ? @"✅" : @"❌");
+        } else {
+            NPLOG(@"⚠️ per-vsync 回调指纹不匹配 → 跳过（主时钟/计数器无法节流）");
         }
 
         if (np_mem_eq(np_at(RVA_VK_CREATE_SWAPCHAIN), fpVkSw, sizeof(fpVkSw))) {
