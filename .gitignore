@@ -3,3 +3,5 @@ artifact/
 *.dylib
 __pycache__/
 .theos/
+device_backup/
+device_config.json
