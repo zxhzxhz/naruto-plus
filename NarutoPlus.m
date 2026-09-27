@@ -615,14 +615,11 @@ static void NpWriteCrashFd(const char *s, size_t n) { if (gCrashFD >= 0) { ssize
 static void NpUncaughtExceptionHandler(NSException *e)
 {
     char buf[1024];
-    int n = snprintf(buf, sizeof(buf), "
-[EXCEPTION] %s: %s
-", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?");
+    int n = snprintf(buf, sizeof(buf), "\n[EXCEPTION] %s: %s\n", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?");
     NpWriteCrashFd(buf, (size_t)MAX(n, 0));
     NSArray *sym = e.callStackSymbols;
     for (NSUInteger i = 0; i < sym.count && i < 40; i++) {
-        n = snprintf(buf, sizeof(buf), "  %s
-", [sym[i] UTF8String] ?: "?");
+        n = snprintf(buf, sizeof(buf), "  %s\n", [sym[i] UTF8String] ?: "?");
         NpWriteCrashFd(buf, (size_t)MAX(n, 0));
     }
 }
@@ -639,9 +636,7 @@ static void NpSignalHandler(int sig, siginfo_t *info, void *uap)
         sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
     }
     int n = snprintf(buf, sizeof(buf),
-                     "
-[SIGNAL] %d addr=%p pc=0x%lx(RVA 0x%x) lr=0x%lx(RVA 0x%x) sp=0x%lx fp=0x%lx
-",
+                     "\n[SIGNAL] %d addr=%p pc=0x%lx(RVA 0x%x) lr=0x%lx(RVA 0x%x) sp=0x%lx fp=0x%lx\n",
                      sig, info ? info->si_addr : 0, (unsigned long)pc, NpRVAByPtrFwd(pc),
                      (unsigned long)lr, NpRVAByPtrFwd(lr), (unsigned long)sp, (unsigned long)fp);
     NpWriteCrashFd(buf, (size_t)MAX(n, 0));
@@ -649,8 +644,7 @@ static void NpSignalHandler(int sig, siginfo_t *info, void *uap)
     void *bt[80];
     int nb = backtrace(bt, 80);
     for (int i = 0; i < nb; i++) {
-        n = snprintf(buf, sizeof(buf), "  #%-2d 0x%lx  RVA 0x%x
-", i,
+        n = snprintf(buf, sizeof(buf), "  #%-2d 0x%lx  RVA 0x%x\n", i,
                      (unsigned long)(uintptr_t)bt[i], NpRVAByPtrFwd((uintptr_t)bt[i]));
         NpWriteCrashFd(buf, (size_t)MAX(n, 0));
     }
