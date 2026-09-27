@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.6"
+#define NP_VERSION              @"1.7"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -111,6 +111,9 @@
 #define RVA_TIME_BASE_GLOBAL    0xD59FC8u   // dword_100D59FC8 = 3000（全引擎时间基，__TEXT,__const）
 #define TIME_BASE_DEFAULT       3000u
 #define NP_IMAGE_MAX_RVA        0x12B8000u  // narutoNext1 文件大小（用于指针→RVA 映射）
+#define RVA_VSYNC_CB            0x4EA888u   // nuccSys per-vsync 回调（游戏主时钟）
+#define RVA_VSYNC_CLK_SITE1     0x4EA8B8u   // MOVZ/MOVK/UMULL/LSR = (时间基/60) → 主时钟每拍增量
+#define RVA_VSYNC_CLK_SITE2     0x4EA8D8u
 
 // nuccSys 字段
 #define OFF_NUCC_RENDER_W       1196u       // +0x4AC
@@ -231,6 +234,7 @@ static BOOL np_mem_eq(const void *p, const void *ref, size_t n)
 static void     NpEnforceEngineState(const char *why);
 static uint8_t  NpEngineFpsByte(void);
 static uint32_t NpTimeBaseLive(void);
+static void     NpApplyVsyncClock(void);
 
 #pragma mark - ============================ 配置 ============================
 
@@ -252,6 +256,7 @@ typedef struct {
     BOOL        forceContentsScale; // 实验档：强制 layer.contentsScale = UIScreen.nativeScale
     BOOL        allowOver60;        // 危险档：允许把引擎 fps 字节写到 >60（默认禁止，进 3D 场景会闪退）
     BOOL        dumpPointers;       // 诊断：把引擎关键函数指针映射成 RVA 打进日志（默认开，只读）
+    BOOL        clockCompensate;    // 主时钟补偿：把 vsync 回调里的 ÷60 补成 ÷(字节×分频器)（默认开）
     BOOL        noVsync;            // presentMode → IMMEDIATE
     BOOL        captureStderr;
     int         statSeconds;
@@ -291,6 +296,7 @@ static id NpCfgDefaultJSON(void)
         @"forceContentsScale": @NO,
         @"allowEngineFpsOver60": @NO,         // true = 允许 engineFps>60（引擎未支持，风险自负）
         @"dumpPointers": @YES,                // 诊断：打印引擎函数指针 RVA（只读，用于定位帧管线）
+        @"clockCompensate": @YES,             // 主时钟补偿（保持动画与主时钟同源，见 README 不变量）
         @"noVsync"           : @NO,
         @"captureStderr"     : @YES,
         @"statSeconds"       : @5
@@ -431,6 +437,7 @@ static void NpConfigLoad(void)
     if (j[@"forceContentsScale"]) gCfg.forceContentsScale = [j[@"forceContentsScale"] boolValue];
     if (j[@"allowEngineFpsOver60"]) gCfg.allowOver60      = [j[@"allowEngineFpsOver60"] boolValue];
     if (j[@"dumpPointers"])       gCfg.dumpPointers       = [j[@"dumpPointers"] boolValue];
+    if (j[@"clockCompensate"])    gCfg.clockCompensate    = [j[@"clockCompensate"] boolValue];
     if (j[@"noVsync"])            gCfg.noVsync            = [j[@"noVsync"] boolValue];
     if (j[@"captureStderr"])      gCfg.captureStderr      = [j[@"captureStderr"] boolValue];
     if (j[@"statSeconds"])        gCfg.statSeconds        = [j[@"statSeconds"] intValue];
@@ -656,6 +663,8 @@ static void NpEnforceEngineState(const char *why)
         }
     }
 
+    NpApplyVsyncClock();
+
     uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
     if (rend > 0x100000000ULL && gCfg.effDivisor > 0) {
         uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
@@ -736,6 +745,74 @@ static BOOL NpApplyPacerPeriod(int pacerHz)
           ok ? @"✅" : @"⚠️", oldPeriod, period, pacerHz, cur0, cur1, cur2, a0, a1, a2);
     if (ok) NPLOG(@"   ↳ MOVZ W24,#%u  MOVZ W25,#%u  MOVN X26,#%u(=-%u)", period - 1, period, period - 1, period);
     return ok;
+}
+
+#pragma mark - ============================ 游戏主时钟补偿（关键） ============================
+//
+// nuccSys 的 per-vsync 回调 (RVA 0x4EA888) 每拍执行：
+//     MOV W9,#0x88888889 ; UMULL ; LSR X20,X8,#37      ← X20 = *dword_100D59FC8(时间基) / 60
+//     *(u32*)(nuccSys+0x98C) += X20                     ← 主时钟累加
+//     sub_1004CEE58(obj, X20)                           ← 同时以该值推进游戏时间
+//
+// 即「主时钟每拍增量 = 时间基 ÷ 60」，与「动画每帧步进 = 时间基 ÷ fps字节」是两个独立量：
+//   动画速率 = (时间基 ÷ 字节) × (节拍 ÷ 分频器)
+//   时钟速率 = (时间基 ÷ 60)   × 节拍
+// 两者要与数据里固定的 3000 单位/秒 基准同时 1.0×，必须同时满足：
+//   ① 实时流速 1.0×：时间基 = 3000 × 字节 × 分频器 ÷ 节拍
+//   ② 同源一致性    ：主时钟除数 = 字节 × 分频器（默认是 60；30×2 时天然成立）
+// 本函数负责 ②：把 ÷60 的魔数除法整段替换为常量「时间基 ÷ (字节×分频器)」。
+//
+static uint8_t  gClockOrig[16];
+static BOOL     gClockOrigSaved  = NO;
+static uint32_t gClockIncApplied = 0;         // 0 = 未打补丁（引擎默认 ÷60）
+
+static BOOL NpPatchClockSite(uint32_t rva, const void *bytes)
+{
+    static const uint8_t fpSite[16] = {0x29,0x11,0x91,0x52, 0x09,0x11,0xb1,0x72,
+                                       0x08,0x7d,0xa9,0x9b, 0x14,0xfd,0x65,0xd3};
+    if (np_mem_eq(np_at(rva), fpSite, 16) || np_mem_eq(np_at(rva), bytes, 16))
+        return NpPatchCode(np_at(rva), bytes, 16);
+    NPLOG(@"❌ 主时钟 site(0x%x) 指纹不匹配 → 跳过", rva);
+    return NO;
+}
+
+static void NpApplyVsyncClock(void)
+{
+    if (!gBase || !gCfg.enabled || gCfg.probe || !gCfg.clockCompensate) return;
+
+    uint8_t  byte = NpEngineFpsByte();
+    if (byte == 0) return;                                  // 引擎尚未初始化
+    uint32_t div  = (gCfg.effDivisor > 0) ? (uint32_t)gCfg.effDivisor : 1u;
+    uint32_t tb   = (gCfg.timeBase > 0) ? (uint32_t)gCfg.timeBase : NpTimeBaseLive();
+    uint32_t d    = (uint32_t)byte * div;
+    if (d == 0 || tb == 0) return;
+
+    uint32_t nativeInc = tb / 60u;                          // 引擎默认行为
+    uint32_t want      = tb / d;                            // 补偿后（d==60 时与 native 相同）
+    if (want == 0) want = 1;
+
+    if (want == nativeInc) {                                // 不变量天然成立 → 还原（若曾补过）
+        if (gClockIncApplied == 0) return;
+        BOOL ok = YES;
+        for (int i = 0; i < 2; i++)
+            ok = NpPatchClockSite(i ? RVA_VSYNC_CLK_SITE2 : RVA_VSYNC_CLK_SITE1, gClockOrig) && ok;
+        if (ok) { gClockIncApplied = 0; NPLOG(@"✅ [CLOCK] 主时钟恢复引擎默认（每拍 %u 单位）", nativeInc); }
+        return;
+    }
+    if (want == gClockIncApplied) return;                   // 已是目标值
+
+    if (!gClockOrigSaved) {
+        memcpy(gClockOrig, np_at(RVA_VSYNC_CLK_SITE1), 16);
+        gClockOrigSaved = YES;
+    }
+    uint32_t patch[4] = { 0x52800000u | (want << 5) | 20u, 0xD503201Fu, 0xD503201Fu, 0xD503201Fu };
+    BOOL ok = YES;
+    for (int i = 0; i < 2; i++)
+        ok = NpPatchClockSite(i ? RVA_VSYNC_CLK_SITE2 : RVA_VSYNC_CLK_SITE1, patch) && ok;
+
+    NPLOG(@"%@ [CLOCK] 主时钟补偿: 每拍 %u 单位（时间基 %u ÷ (字节 %u × 分频器 %u)；引擎默认是 ÷60=%u）",
+          ok ? @"✅" : @"⚠️", want, tb, byte, div, nativeInc);
+    if (ok) gClockIncApplied = want;
 }
 
 #pragma mark - ============================ Vulkan swapchain ============================
@@ -960,8 +1037,18 @@ static void NpApplyConfig(BOOL firstTime)
         double   flowB    = (eb > 0) ? tick / (double)eb : 0;                 // 该全局本身就是单位基准
         NPLOG(@"步进: 时间基=%u(实读 %u)  fps字节=%u(实读 %u) → 单帧 %u 单位 | 帧唤醒 %.0f 次/秒",
               tb, tbLive, eb, liveByte, step, tick);
-        NPLOG(@"时间流速预测: 模型A(固定%u实时基准)=%.2fx   模型B(全局即单位基准)=%.2fx   ← 请与实测手感对照",
-              TIME_BASE_DEFAULT, flowA, flowB);
+        {
+            double animRate = (double)step * tick;                   // 动画/逻辑：单位/秒
+            double clkInc   = (double)tb / (double)((eb > 0) ? (eb * ((gCfg.effDivisor > 0) ? gCfg.effDivisor : 1)) : 60);
+            double clkRate  = clkInc * (double)gCfg.effPacerHz;       // 主时钟：单位/秒
+            NPLOG(@"时间流速: 动画/逻辑 %.0f 单位/秒 → %.2fx ；主时钟 %.0f 单位/秒(每拍 %.0f) → %.2fx   (数据基准 3000)",
+                  animRate, animRate / (double)TIME_BASE_DEFAULT, clkRate, clkInc, clkRate / (double)TIME_BASE_DEFAULT);
+            NPLOG(@"一致性: 字节×分频器 = %u %@ 60 ⇒ 主时钟%@补偿",
+                  eb * ((gCfg.effDivisor > 0) ? gCfg.effDivisor : 1),
+                  (eb * ((gCfg.effDivisor > 0) ? gCfg.effDivisor : 1) == 60) ? @"==" : @"!=",
+                  (eb * ((gCfg.effDivisor > 0) ? gCfg.effDivisor : 1) == 60) ? @"无需" : @"需要");
+            (void)flowA; (void)flowB;
+        }
         if (gCfg.effEngineFps > 0)
             NPLOG(@"ℹ️ 同时按 engineFps=%d 直写 fps 字节（引擎校验上限 60；写 >60 会进 3D 场景闪退）", gCfg.effEngineFps);
         if (gCfg.timeBase <= 0 && gCfg.frameRate > 30)
@@ -973,6 +1060,7 @@ static void NpApplyConfig(BOOL firstTime)
     if (gCfg.probe)    { NPLOG(@"probe=true → 只观察不修改"); return; }
 
     if (gCfg.effPacerHz > 0) NpApplyPacerPeriod(gCfg.effPacerHz);
+    NpApplyVsyncClock();
     if (!gInitThunkHooked && gCfg.effDivisor > 0)
         NPLOG(@"ℹ️ Init thunk 未 hook → 分频器走轮询降级（1 秒粒度）");
     NpPollNuCCSys();

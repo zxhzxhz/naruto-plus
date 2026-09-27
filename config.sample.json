@@ -7,10 +7,12 @@
   "logicFps": 0,
   "engineFps": 0,
   "timeBase": 0,
+  "clockCompensate": true,
   "forceDirect": true,
   "directUsage": false,
   "forceContentsScale": false,
   "allowEngineFpsOver60": false,
+  "dumpPointers": true,
   "noVsync": false,
   "captureStderr": true,
   "statSeconds": 5
