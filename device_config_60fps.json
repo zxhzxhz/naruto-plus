@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "probe": false,
+  "frameRate": 60,
+  "resolution": "native",
+  "pacerHz": 0,
+  "logicFps": 0,
+  "engineFps": 0,
+  "timeBase": 1500,
+  "clockCompensate": true,
+  "vsyncCbHz": 0,
+  "forceDirect": true,
+  "directUsage": false,
+  "forceContentsScale": false,
+  "allowEngineFpsOver60": false,
+  "dumpPointers": false,
+  "noVsync": false,
+  "captureStderr": true,
+  "statSeconds": 5
+}
