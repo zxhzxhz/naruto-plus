@@ -109,7 +109,9 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
   // ★ 开关①：帧率
   "frameRate": 120,       // 0=不改 / 30 / 60 / 120
   "pacerHz": 0,           // VSync 节拍 Hz，0 = 自动（= max(frameRate,60)）
-  "logicFps": 0,          // 0 = 与 frameRate 相同；填 30 表示「节拍仍 120Hz，但每 4 拍才唤醒一次帧」
+  "logicFps": 0,          // 0 = 与 frameRate 相同；填 30 = 每 4 拍才唤醒一次帧（帧率也随之降到 30）
+  "engineFps": 0,         // 直写引擎 fps 字节（逻辑固定步进 3000/fps）；0 = 自动跟 frameRate
+                          //   ★ 120fps 时必须是 120，否则逻辑步进仍是 1/30 → 游戏 4 倍速
 
   // ★ 开关②：分辨率
   "resolution": "native", // "native" | "1.0"/"0.75"/"0.5"(按屏幕像素比例) | "1920x1080"(固定)
@@ -134,7 +136,9 @@ Metal HUD 那行显示的是 **iOS 的呈现路径**：
 | 先求稳，只跑到 60 | `frameRate:60, resolution:"native"` |
 | 掉帧时降负载 | `frameRate:120, resolution:"0.75"` |
 | 强制固定 1080p | `resolution:"1920x1080"` |
-| 逻辑步进不想被改（帧唤醒仍 30 次/秒） | `frameRate:120, logicFps:30` |
+| 120fps + 时间流速正确（推荐） | `frameRate:120, engineFps:0`（自动写 120 → 步进 1/120） |
+| 只跑 60fps（画面与逻辑都 1×） | `frameRate:60, engineFps:0` |
+| 逻辑要按原样 30Hz（帧率也会掉到 30） | `frameRate:120, logicFps:30` |
 
 ---
 
@@ -200,4 +204,5 @@ Hook 引擎: MSHookFunction=0x...                                  ← 非 0 = e
 | 版本 | 内容 |
 |---|---|
 | v1.0 | 首版：VSync 节拍补丁 + Init 分频器改写 + swapchain 分辨率/直写属性 hook + 图层统计；配置双开关 + 热重载 |
+| **v1.2** | **解耦「渲染帧率」与「逻辑步进」**：定位到引擎内部时间基 = 3000 单位/秒，逻辑固定步进 = `3000 / nuccSys[+0x992]`（`sub_1004D4838` / `sub_1004F836C` / `sub_10051F96C` / `sub_1005205C8` 四处实锤）。120fps 下若步进仍为 1/30 会 4× 加速 ⇒ 新增 `engineFps`（默认自动 = frameRate）直写 fps 字节=120 → 步进 25/3000 秒 = 1/120，时间流速回归 1.0×；并把「分频器 + fps 字节」的纠正收敛到 `NpEnforceEngineState()`，在 `SetFrameRate` hook 之后、`Init` 之后、每秒轮询三个时机强制执行（游戏自己调 `SetFrameRate(30)` 会被立刻纠回） |
 | **v1.1** | 修 `%s` 传 NSString 导致日志乱码；配置改为非原子写+回读校验、无效配置自动备份 `.bad` 并重写；**分辨率改为以「引擎请求的 extent」为原生基准**（不再依赖 UIScreen，constructor 阶段即可正确决策）；`forceDirect` 判定同样去 UIKit 依赖（修复设备实测 direct 未生效）；新增 `[GEO]` 图层/屏幕几何快照、`directUsage` / `forceContentsScale` 实验开关；STAT 行补充 Init/SetFrameRate 调用计数与 swapchain 原始→覆写尺寸 |

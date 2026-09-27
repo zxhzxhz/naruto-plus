@@ -5,6 +5,7 @@
   "resolution": "native",
   "pacerHz": 0,
   "logicFps": 0,
+  "engineFps": 0,
   "forceDirect": true,
   "directUsage": false,
   "forceContentsScale": false,

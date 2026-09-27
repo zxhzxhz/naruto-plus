@@ -88,7 +88,7 @@
 
 #pragma mark - ============================ 常量 ============================
 
-#define NP_VERSION              @"1.1"
+#define NP_VERSION              @"1.2"
 #define NP_LOG_FILENAME         @"NarutoPlus.log"
 #define NP_CFG_FILENAME         @"NarutoPlus.json"
 #define NP_LOG_MAX_BYTES        (12u * 1024u * 1024u)
@@ -112,7 +112,9 @@
 #define OFF_NUCC_RENDER_W       1196u       // +0x4AC
 #define OFF_NUCC_RENDER_H       1198u       // +0x4AE
 #define OFF_NUCC_FPS_DIVISOR    1208u       // +0x4B8
-#define OFF_NUCC_FPS_EFFECTIVE  2450u       // +0x992
+#define OFF_NUCC_FPS_EFFECTIVE  2450u       // +0x992 生效 fps（= 固定步进 3000/fps 的来源）
+#define OFF_NUCC_FPS_REQUESTED  2451u       // +0x993 请求 fps
+#define NUCC_TIME_BASE_PER_SEC  3000u       // 引擎内部时间基：3000 单位 = 1 秒
 #define OFF_NUMM_FPS_DIVISOR    0x9Cu       // nummRender+156
 
 // VkSwapchainCreateInfoKHR 字段偏移（与 MoltenVK 内部读法交叉验证过）
@@ -206,6 +208,7 @@ static uint32_t np_rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static uint16_t np_rd16(uintptr_t a) { return *(volatile uint16_t *)a; }
 static void     np_wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static void     np_wr16(uintptr_t a, uint16_t v) { *(volatile uint16_t *)a = v; }
+static void     np_wr8 (uintptr_t a, uint8_t  v) { *(volatile uint8_t  *)a = v; }
 
 static NSString *np_hexdump(const void *p, size_t n)
 {
@@ -230,6 +233,7 @@ typedef struct {
     int         frameRate;          // 0 = 不改；30 / 60 / 120
     int         pacerHz;            // 0 = 自动（= max(frameRate,60)，上限 120）
     int         logicFps;           // 0 = 与 frameRate 相同（分频器按它算）
+    int         engineFps;          // 直写引擎 fps 字节（= 固定步进 3000/fps）；0 = 自动 = frameRate
     NpResMode   resMode;
     double      resScale;
     int         resW, resH;
@@ -243,6 +247,7 @@ typedef struct {
     int         effFps;
     int         effPacerHz;
     int         effDivisor;
+    int         effEngineFps;       // 最终写入 nuccSys+0x992 的值
 } NpConfig;
 
 static NpConfig  gCfg;
@@ -267,6 +272,7 @@ static id NpCfgDefaultJSON(void)
         @"resolution"        : @"native",     // 开关②："native" | "1.0"/"0.75"(比例) | "1920x1080"
         @"pacerHz"           : @0,
         @"logicFps"          : @0,
+        @"engineFps"         : @0,            // 0 = 自动跟 frameRate（120fps 时写 120 → 逻辑步进 1/120，速度不变）
         @"forceDirect"       : @YES,
         @"directUsage"       : @NO,
         @"forceContentsScale": @NO,
@@ -317,7 +323,7 @@ static void NpConfigDefaults(void)
 static void NpComputePlan(void)
 {
     if (gCfg.frameRate <= 0) {
-        gCfg.effFps = 0; gCfg.effPacerHz = 0; gCfg.effDivisor = 0;
+        gCfg.effFps = 0; gCfg.effPacerHz = 0; gCfg.effDivisor = 0; gCfg.effEngineFps = 0;
         return;
     }
     int pacer = (gCfg.pacerHz > 0) ? gCfg.pacerHz : MAX(gCfg.frameRate, 60);
@@ -330,6 +336,13 @@ static void NpComputePlan(void)
     gCfg.effFps = gCfg.frameRate;
     gCfg.effPacerHz = pacer;
     gCfg.effDivisor = div;
+
+    // 引擎 fps 字节 = 逻辑固定步进 3000/fps。要让 120fps 下时间流速仍为 1.0×，
+    // 必须让步进与实际帧率一致 ⇒ 直写 +0x992 = frameRate（120fps → 25 单位/帧 = 1/120 秒）
+    int ef = (gCfg.engineFps > 0) ? gCfg.engineFps : gCfg.frameRate;
+    if (ef < 1)   ef = 1;
+    if (ef > 255) ef = 255;
+    gCfg.effEngineFps = ef;
 }
 
 // 非原子写 + 回读校验（LiveContainer 的路径映射下原子写(rename)可能不可靠）
@@ -388,6 +401,7 @@ static void NpConfigLoad(void)
     if (j[@"frameRate"])          gCfg.frameRate          = [j[@"frameRate"] intValue];
     if (j[@"pacerHz"])            gCfg.pacerHz            = [j[@"pacerHz"] intValue];
     if (j[@"logicFps"])           gCfg.logicFps           = [j[@"logicFps"] intValue];
+    if (j[@"engineFps"])          gCfg.engineFps          = [j[@"engineFps"] intValue];
     if (j[@"forceDirect"])        gCfg.forceDirect        = [j[@"forceDirect"] boolValue];
     if (j[@"directUsage"])        gCfg.directUsage        = [j[@"directUsage"] boolValue];
     if (j[@"forceContentsScale"]) gCfg.forceContentsScale = [j[@"forceContentsScale"] boolValue];
@@ -408,6 +422,11 @@ static void NpConfigLoad(void)
              : (gCfg.resMode == NpResModeScale ? [NSString stringWithFormat:@"scale %.3f", gCfg.resScale]
                                                : [NSString stringWithFormat:@"%dx%d", gCfg.resW, gCfg.resH])),
           gCfg.forceDirect, gCfg.directUsage, gCfg.forceContentsScale, gCfg.noVsync, gCfg.pacerHz, gCfg.logicFps);
+    NPLOG(@"引擎 fps 字节将写为 %d → 逻辑固定步进 %u/3000 秒 (%.2f ms/帧)；%u%%%d=%u",
+          gCfg.effEngineFps, NUCC_TIME_BASE_PER_SEC / (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
+          1000.0 / (double)(gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
+          NUCC_TIME_BASE_PER_SEC, (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1),
+          NUCC_TIME_BASE_PER_SEC % (gCfg.effEngineFps > 0 ? gCfg.effEngineFps : 1));
 }
 
 #pragma mark - ============================ 目标分辨率推导 ============================
@@ -485,6 +504,9 @@ static BOOL NpResolveHookEngine(void)
 
 #pragma mark - ============================ 帧率 ============================
 
+// 前向声明：Init / SetFrameRate hook 内会用到（定义在下方）
+static void NpEnforceEngineState(const char *why);
+
 typedef int64_t (*InitThunkFn)(int16_t w, int16_t h, uint32_t preset, uint32_t flags, uint32_t divisor);
 static InitThunkFn gOrigInitThunk = NULL;
 static BOOL        gInitThunkHooked = NO;
@@ -507,8 +529,12 @@ static int64_t NpHook_InitThunk(int16_t w, int16_t h, uint32_t preset, uint32_t 
 
     uint32_t nd = (gCfg.effDivisor > 0) ? (uint32_t)gCfg.effDivisor : divisor;
 
-    NPLOG(@"[INIT] #%d nummRender::Init 引擎入参 w=%d h=%d preset=%u flags=0x%x divisor=%u  →  改写 w=%d h=%d divisor=%u  (原生=%d 目标 %dfps / 节拍 %dHz)",
-          gInitThunkCalls, w, h, preset, flags, divisor, tw, th, nd, isNative, gCfg.effFps, gCfg.effPacerHz);
+    uint8_t engFps = 0;
+    uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
+    if (inst > 0x100000000ULL) engFps = *(volatile uint8_t *)(inst + OFF_NUCC_FPS_EFFECTIVE);
+    NPLOG(@"[INIT] #%d nummRender::Init 引擎入参 w=%d h=%d preset=%u flags=0x%x divisor=%u (引擎fps字节=%u)  →  改写 w=%d h=%d divisor=%u  (原生=%d 目标 %dfps / 节拍 %dHz)",
+          gInitThunkCalls, w, h, preset, flags, divisor, engFps, tw, th, nd, isNative, gCfg.effFps, gCfg.effPacerHz);
+    NpEnforceEngineState("Init后");
 
     return gOrigInitThunk((int16_t)tw, (int16_t)th, preset, flags, nd);
 }
@@ -516,39 +542,67 @@ static int64_t NpHook_InitThunk(int16_t w, int16_t h, uint32_t preset, uint32_t 
 static int64_t NpHook_SetFrameRate(uintptr_t self, uint32_t fps)
 {
     gSetFrameRateCalls++;
-    NPLOG(@"[FPS] 游戏调用 nuccSys::SetFrameRate(%u)  (仅记录；分频器由本补丁在 Init 阶段覆盖)", fps);
-    return gOrigSetFrameRate(self, fps);
+    int64_t r = gOrigSetFrameRate(self, fps);
+
+    // 游戏会用它重置「分频器 + fps 字节」（+0x992/+0x4B8），必须在返回后立刻纠回，
+    // 否则 120fps 会掉回 (60/2)=30fps、或步进回到 1/30 造成 4× 加速。
+    uint8_t eff = (self > 0x100000000ULL) ? *(volatile uint8_t *)(self + OFF_NUCC_FPS_EFFECTIVE) : 0;
+    uint32_t div = (self > 0x100000000ULL) ? *(volatile uint32_t *)(self + OFF_NUCC_FPS_DIVISOR) : 0;
+    NPLOG(@"[FPS] 游戏调用 nuccSys::SetFrameRate(%u) → 引擎内部: fps字节=%u 分频器=%u  (本补丁随后纠正)", fps, eff, div);
+
+    NpEnforceEngineState("SetFrameRate后");
+    return r;
 }
 
 // hook 不可用 / Init 未命中时的兜底：直接写单例字段（VSync 线程每拍实时读 nummRender+0x9C）
-static void NpPollNuCCSys(void)
+// ── 引擎侧状态强制（唯一收敛点）──
+//   nuccSys+0x992 : 生效 fps 字节 → 逻辑固定步进 = 3000/fps 单位（1 单位 = 1/3000 秒）
+//   nuccSys+0x4B8 : 60/fps 分频器（引擎自己的记账）
+//   nummRender+0x9C : VSync 线程每拍实时读取的分频器 ← 真正决定帧唤醒频率
+static void NpEnforceEngineState(const char *why)
 {
     if (!gBase || !gCfg.enabled || gCfg.probe) return;
 
-    if (gCfg.effDivisor > 0) {
-        uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
-        if (rend > 0x100000000ULL) {
-            uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
-            if (d2 != (uint32_t)gCfg.effDivisor) {
-                np_wr32(rend + OFF_NUMM_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
-                NPLOG(@"[FPS] (轮询) nummRender+0x9C 分频器 %u → %d", d2, gCfg.effDivisor);
+    uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
+    if (inst > 0x100000000ULL) {
+        uint8_t eff = *(volatile uint8_t *)(inst + OFF_NUCC_FPS_EFFECTIVE);
+        if (eff != 0 && gCfg.effEngineFps > 0 && eff != (uint8_t)gCfg.effEngineFps) {
+            np_wr8(inst + OFF_NUCC_FPS_EFFECTIVE, (uint8_t)gCfg.effEngineFps);
+            np_wr8(inst + OFF_NUCC_FPS_REQUESTED, (uint8_t)gCfg.effEngineFps);
+            NPLOG(@"[STEP] (%@) 引擎 fps 字节 %u → %d  ⇒ 逻辑固定步进 %u/3000 秒/帧 (%.2f ms → %.2f ms，时间流速 %.2fx)",
+                  [NSString stringWithUTF8String:why], eff, gCfg.effEngineFps,
+                  NUCC_TIME_BASE_PER_SEC / gCfg.effEngineFps,
+                  1000.0 / (double)eff, 1000.0 / (double)gCfg.effEngineFps,
+                  (double)gCfg.effEngineFps / (double)eff);
+        }
+        if (gCfg.effDivisor > 0) {
+            uint32_t div = *(volatile uint32_t *)(inst + OFF_NUCC_FPS_DIVISOR);
+            if (div != (uint32_t)gCfg.effDivisor) {
+                np_wr32(inst + OFF_NUCC_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
+                NPLOG(@"[FPS] (%@) nuccSys+0x4B8 分频器 %u → %d", [NSString stringWithUTF8String:why], div, gCfg.effDivisor);
             }
         }
     }
 
-    uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
-    if (!inst || inst < 0x100000000ULL) return;
-
-    uint8_t fps = *(volatile uint8_t *)(inst + OFF_NUCC_FPS_EFFECTIVE);
-    if (fps == 0) return;                                  // 尚未初始化
-
-    if (gCfg.effDivisor > 0) {
-        uint32_t div = *(volatile uint32_t *)(inst + OFF_NUCC_FPS_DIVISOR);
-        if (div != (uint32_t)gCfg.effDivisor) {
-            np_wr32(inst + OFF_NUCC_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
-            NPLOG(@"[FPS] (轮询) nuccSys+0x4B8 分频器 %u → %d", div, gCfg.effDivisor);
+    uintptr_t rend = *(volatile uintptr_t *)(gBase + RVA_NUMMRENDER_INSTANCE);
+    if (rend > 0x100000000ULL && gCfg.effDivisor > 0) {
+        uint32_t d2 = *(volatile uint32_t *)(rend + OFF_NUMM_FPS_DIVISOR);
+        if (d2 != (uint32_t)gCfg.effDivisor) {
+            np_wr32(rend + OFF_NUMM_FPS_DIVISOR, (uint32_t)gCfg.effDivisor);
+            NPLOG(@"[FPS] (%@) nummRender+0x9C 分频器 %u → %d", [NSString stringWithUTF8String:why], d2, gCfg.effDivisor);
         }
     }
+}
+
+// 兼容旧调用点
+static void NpPollNuCCSys(void) { NpEnforceEngineState("轮询"); }
+
+// 读当前引擎 fps 字节（仅用于日志）
+static uint8_t NpEngineFpsByte(void)
+{
+    uintptr_t inst = *(volatile uintptr_t *)(gBase + RVA_NUCCSYS_INSTANCE);
+    if (inst > 0x100000000ULL) return *(volatile uint8_t *)(inst + OFF_NUCC_FPS_EFFECTIVE);
+    return 0;
 }
 
 static BOOL NpApplyPacerPeriod(int pacerHz)
@@ -868,10 +922,11 @@ static void *NpStatThread(void *arg)
         (void)lastT;
 
         NPLOG(@"[STAT] 实测 %.1f fps (%llu 帧 / %.1fs) · drawableSize=%dx%d · layer(opaque=%d fbOnly=%d vsync=%d contentsScale=%.1f) · "
-              @"分频器=%d 节拍=%dHz · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
+              @"分频器=%d 节拍=%dHz · 引擎fps字节=%u(步进 %u/3000s) · swapchain(原始 %ux%u → 覆写 %ux%u) · Init调用=%d SetFrameRate调用=%d",
               fps, (unsigned long long)delta, dt, gLastDrawableW, gLastDrawableH,
               gLayerOpaque, gLayerFramebufferOnly, gLayerDisplaySync, gLayerContentsScale,
               gCfg.effDivisor, gCfg.effPacerHz,
+              NpEngineFpsByte(), NUCC_TIME_BASE_PER_SEC / (NpEngineFpsByte() ? NpEngineFpsByte() : 1),
               gLastOrigW, gLastOrigH, gLastNewW, gLastNewH,
               gInitThunkCalls, gSetFrameRateCalls);
 
